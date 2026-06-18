@@ -62,5 +62,6 @@ void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_ha
 Snapshot snapshot();
 void log_snapshot_once();
 void log_dx12_candidates_periodic();
+void log_dx12_frame_summary_tick();
 
 } // namespace capture::scout

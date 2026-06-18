@@ -1037,6 +1037,7 @@ bool on_present(IDXGISwapChain* sc) {
     }
 
     update_fps_counters(0);
+    capture::scout::log_dx12_frame_summary_tick();
 
     ++g_present_count;
     if ((g_effect_enabled || g_menu_visible || g_generated_present_enabled) && g_present_count <= kWarmupPresents) {

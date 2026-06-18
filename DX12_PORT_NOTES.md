@@ -236,3 +236,28 @@ Expected log markers:
 ```
 
 This still does not feed discovered candidates into frame generation. It is the data-gathering step needed before depth-assisted rejection or velocity-buffer experiments.
+
+## Scout v2.1 DX12/DX11 parity diagnostics
+
+This patch adds two practical diagnostics upgrades:
+
+- DX12 scout summaries are flushed from the Present path every 120 real Presents, even when command-list hooks do not emit enough ExecuteCommandLists activity to hit the older periodic logger.
+- DX11 depth/scout hooks now cover more of the same high-value render flow we learned from the DX12 work: OMSetRenderTargetsAndUnorderedAccessViews, Draw, DrawIndexed, and PSSetShaderResources. This gives DX11 logs enough context to tell whether the game is actively using the generic scout path.
+
+Expected DX12 lines:
+
+```text
+[scout-dx12] presentSummary cmdlists=... exec=... draws=... barriers=... rtv=... dsv=... omrt=... omdsv=... depthCand=... mvCand=...
+```
+
+Expected DX11 lines when testing a DX11 game:
+
+```text
+[depth] OMSetRenderTargetsAndUAV hooked
+[depth] Draw hooked
+[depth] DrawIndexed hooked
+[depth] PSSetShaderResources hooked
+[scout-dx11] om=... omuav=... draw=... pssrv=... depth=...
+```
+
+This is still a detection/diagnostic patch. It does not yet feed discovered DX12/DX11 depth or motion candidates into the frame-generation shader.

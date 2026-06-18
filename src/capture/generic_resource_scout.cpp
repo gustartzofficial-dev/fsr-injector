@@ -25,6 +25,7 @@ namespace {
     Snapshot g_state{};
     bool g_logged = false;
     unsigned g_periodic_log_count = 0;
+    unsigned g_present_log_count = 0;
     std::unordered_map<SIZE_T, DescriptorInfo> g_descriptors;
 
     bool is_depth_format(DXGI_FORMAT f) {
@@ -206,6 +207,17 @@ void log_dx12_candidates_periodic() {
     Snapshot s = snapshot();
     if ((++g_periodic_log_count % 600) != 0) return;
     LOGF("[scout-dx12] cmdlists=%u exec=%u draws=%u barriers=%u pso=%u rootTbl=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
+         s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers, s.dx12_pso_sets, s.dx12_root_table_sets,
+         s.dx12_rtv_descriptors, s.dx12_dsv_descriptors, s.dx12_om_rt_binds, s.dx12_om_depth_binds,
+         s.dx12_depth_candidates, s.dx12_best_depth_width, s.dx12_best_depth_height, fmt_name(s.dx12_best_depth_format),
+         s.dx12_motion_candidates, s.dx12_best_motion_width, s.dx12_best_motion_height, fmt_name(s.dx12_best_motion_format));
+}
+
+void log_dx12_frame_summary_tick() {
+    Snapshot s = snapshot();
+    if (s.api != ApiKind::DX12) return;
+    if ((++g_present_log_count % 120) != 0) return;
+    LOGF("[scout-dx12] presentSummary cmdlists=%u exec=%u draws=%u barriers=%u pso=%u rootTbl=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
          s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers, s.dx12_pso_sets, s.dx12_root_table_sets,
          s.dx12_rtv_descriptors, s.dx12_dsv_descriptors, s.dx12_om_rt_binds, s.dx12_om_depth_binds,
          s.dx12_depth_candidates, s.dx12_best_depth_width, s.dx12_best_depth_height, fmt_name(s.dx12_best_depth_format),
