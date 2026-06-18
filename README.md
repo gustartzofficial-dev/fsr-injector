@@ -164,3 +164,9 @@ Controls:
 ### Generic Resource Scout v1
 
 The DX12 scout now hooks command queues, command lists, RTV/DSV descriptor creation, render-target binding, barriers, and draw calls. It reports candidate depth and motion-vector-like resources in the log and menu. This is a discovery layer only; candidates are not yet consumed by the frame-generation shader.
+
+### Scout v2: command-list tracking
+
+Suggested commit name: `Add DX12 command-list scout tracking`
+
+This build adds DX12 command-list hook coverage so the generic scout can begin seeing how the game uses render targets/depth buffers during command recording. Look for `[scout-dx12]` lines in `fsr-injector.log` after a short time in-game.

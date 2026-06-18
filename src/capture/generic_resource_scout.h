@@ -31,6 +31,8 @@ struct Snapshot {
     unsigned dx12_dsv_descriptors = 0;
     unsigned dx12_om_depth_binds = 0;
     unsigned dx12_om_rt_binds = 0;
+    unsigned dx12_pso_sets = 0;
+    unsigned dx12_root_table_sets = 0;
 
     unsigned dx12_depth_candidates = 0;
     unsigned dx12_motion_candidates = 0;
@@ -51,6 +53,8 @@ void note_dx12_command_list_seen();
 void note_dx12_execute_call(unsigned command_list_count);
 void note_dx12_draw_call(bool indexed);
 void note_dx12_resource_barrier(unsigned count);
+void note_dx12_set_pipeline_state();
+void note_dx12_set_graphics_root_descriptor_table();
 void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc);
 void note_dx12_dsv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc);
 void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_handles, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_handle);

@@ -209,3 +209,30 @@ Expected log lines after some gameplay:
 ```
 
 If `depthCand` stays at zero, the next scout step is descriptor-heap scanning or device-resource creation hooks. If `mvCand` stays zero, the game may not render velocity buffers at all, which is common for older/non-upscaler games.
+
+## Scout v2 command-list tracking
+
+Suggested commit name: `Add DX12 command-list scout tracking`
+
+This version fixes the command-list scout vtable slots and adds early command-list hooking through `ID3D12Device::CreateCommandList`. It now attempts to track actual command recording calls instead of only device/queue creation:
+
+- `ID3D12Device::CreateCommandList`
+- `ID3D12GraphicsCommandList::DrawInstanced`
+- `ID3D12GraphicsCommandList::DrawIndexedInstanced`
+- `ID3D12GraphicsCommandList::SetPipelineState`
+- `ID3D12GraphicsCommandList::ResourceBarrier`
+- `ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable`
+- `ID3D12GraphicsCommandList::OMSetRenderTargets`
+
+Expected log markers:
+
+```text
+[dx12] hooked ID3D12Device::CreateCommandList
+[dx12] hooked ID3D12GraphicsCommandList::DrawInstanced
+[dx12] hooked ID3D12GraphicsCommandList::DrawIndexedInstanced
+[dx12] hooked ID3D12GraphicsCommandList::ResourceBarrier
+[dx12] hooked ID3D12GraphicsCommandList::OMSetRenderTargets
+[scout-dx12] cmdlists=... exec=... draws=... barriers=... pso=... rootTbl=... rtv=... dsv=... omrt=... omdsv=... depthCand=... mvCand=...
+```
+
+This still does not feed discovered candidates into frame generation. It is the data-gathering step needed before depth-assisted rejection or velocity-buffer experiments.

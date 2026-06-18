@@ -121,6 +121,8 @@ void note_dx12_command_list_seen() { std::lock_guard<std::mutex> lk(g_mtx); ++g_
 void note_dx12_execute_call(unsigned command_list_count) { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_execute_calls; g_state.dx12_command_lists_seen += command_list_count; }
 void note_dx12_draw_call(bool) { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_draw_calls; }
 void note_dx12_resource_barrier(unsigned count) { std::lock_guard<std::mutex> lk(g_mtx); g_state.dx12_resource_barriers += count; }
+void note_dx12_set_pipeline_state() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_pso_sets; }
+void note_dx12_set_graphics_root_descriptor_table() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_root_table_sets; }
 
 void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc) {
     if (!resource || !handle.ptr) return;
@@ -203,8 +205,8 @@ void log_snapshot_once() {
 void log_dx12_candidates_periodic() {
     Snapshot s = snapshot();
     if ((++g_periodic_log_count % 600) != 0) return;
-    LOGF("[scout-dx12] cmdlists=%u exec=%u draws=%u barriers=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
-         s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers,
+    LOGF("[scout-dx12] cmdlists=%u exec=%u draws=%u barriers=%u pso=%u rootTbl=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
+         s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers, s.dx12_pso_sets, s.dx12_root_table_sets,
          s.dx12_rtv_descriptors, s.dx12_dsv_descriptors, s.dx12_om_rt_binds, s.dx12_om_depth_binds,
          s.dx12_depth_candidates, s.dx12_best_depth_width, s.dx12_best_depth_height, fmt_name(s.dx12_best_depth_format),
          s.dx12_motion_candidates, s.dx12_best_motion_width, s.dx12_best_motion_height, fmt_name(s.dx12_best_motion_format));
