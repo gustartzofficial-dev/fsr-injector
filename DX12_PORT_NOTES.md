@@ -149,24 +149,24 @@ The DX12 native overlay now separates menu visibility from the post-process togg
 
 When the effect is off but the menu is visible, the backend copies the original backbuffer through unchanged and draws the menu over it, avoiding the blurred low-res reconstruction path.
 
-## Experimental DX12 frame history + interpolation
+## Patch: FSR1-style pass + generated-frame presentation experiment
 
-This build adds a first DX12 frame-history path and an experimental interpolation toggle.
+Suggested commit name: `Add FSR1 pass and experimental generated frame presentation`
 
-- A full-resolution history texture is allocated next to the existing input/low-res textures.
-- Each Present copies the current captured frame into history after the post-process pass is submitted.
-- Once history has warmed up, F4 toggles an experimental previous/current blend mode.
-- This is **not** full frame generation yet: it does not insert extra swapchain Presents or improve frame pacing. It validates the resources, barriers, and shader path needed before generated-frame scheduling is attempted.
+This patch upgrades the DX12 test upscaler naming/path to an FSR1-style EASU/RCAS pass and adds a guarded generated-frame presentation experiment.
 
-Controls:
+New/updated controls:
 
 - Home: show/hide native DX12 menu
 - End: enable/disable DX12 post-process
-- PageUp/PageDown: sharpness
-- Insert/Delete: scale
+- PageUp/PageDown: sharpness up/down
+- Insert/Delete: internal scale up/down
 - F1/F2/F3: quality/balanced/performance presets
-- F4: experimental interpolation blend
+- F4: preview interpolation inside real frames
+- F5: experimental generated-frame presentation
 
-Environment:
+New environment option:
 
-- `FSRINJ_DX12_INTERP=1` starts with interpolation enabled.
+- `FSRINJ_DX12_GENPRESENT=1` starts with generated-frame presentation enabled.
+
+Important: F5 is experimental. It renders an interpolated generated texture from previous/current history and presents it as an extra swapchain present after the real game present. If it stutters or misbehaves, leave F5 disabled and continue using F4 preview interpolation for validation.
