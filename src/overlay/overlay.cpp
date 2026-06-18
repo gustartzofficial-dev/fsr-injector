@@ -12,6 +12,7 @@
 #include <d3d11.h>
 #include <d3d12.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -156,6 +157,14 @@ void on_present(IDXGISwapChain* sc) {
 
     g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+}
+
+void after_present(IDXGISwapChain* sc, unsigned int flags, PresentFn present_fn) {
+    if (g_dx12_mode) overlay::dx12::after_present(sc, flags, reinterpret_cast<overlay::dx12::PresentFn>(present_fn));
+}
+
+void after_present1(IDXGISwapChain1* sc, unsigned int flags, const DXGI_PRESENT_PARAMETERS* pp, Present1Fn present1_fn) {
+    if (g_dx12_mode) overlay::dx12::after_present1(sc, flags, pp, reinterpret_cast<overlay::dx12::Present1Fn>(present1_fn));
 }
 
 void on_resize_buffers() {

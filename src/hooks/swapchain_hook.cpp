@@ -38,7 +38,9 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT 
         upscaler::sharpen(sc);
     }
     overlay::on_present(sc);
-    return g_orig_present(sc, sync, flags);
+    HRESULT hr = g_orig_present(sc, sync, flags);
+    if (SUCCEEDED(hr)) overlay::after_present(sc, flags, g_orig_present);
+    return hr;
 }
 
 // Flip-model present path (most modern D3D11 games).
@@ -49,7 +51,9 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UIN
         upscaler::sharpen(sc);
     }
     overlay::on_present(sc);
-    return g_orig_present1(sc, sync, flags, pp);
+    HRESULT hr = g_orig_present1(sc, sync, flags, pp);
+    if (SUCCEEDED(hr)) overlay::after_present1(sc, flags, pp, g_orig_present1);
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,

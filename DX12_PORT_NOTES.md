@@ -170,3 +170,8 @@ New environment option:
 - `FSRINJ_DX12_GENPRESENT=1` starts with generated-frame presentation enabled.
 
 Important: F5 is experimental. It renders an interpolated generated texture from previous/current history and presents it as an extra swapchain present after the real game present. If it stutters or misbehaves, leave F5 disabled and continue using F4 preview interpolation for validation.
+
+
+## Native DX12 menu usability update
+
+The overlay now displays F4 preview interpolation, F5 generated-frame presentation, and frame-history readiness directly in the panel. F5 was easy to miss in logs because the previous panel did not show generated-present state. Mouse click zones were added for POST toggle, scale bar, sharpness bar, F4 preview interpolation, and F5 generated-frame presentation.

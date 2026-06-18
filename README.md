@@ -141,6 +141,8 @@ The DX12 backend uses a lightweight native overlay instead of Dear ImGui.
 
 The menu should remain visible while the post-process effect is on or off. The post-process effect and menu visibility are separate states.
 
-### DX12 experimental interpolation
+### DX12 generated-frame experiment
 
-The DX12 backend now includes a frame-history texture and a first interpolation experiment. Press `F4` to toggle the previous/current frame blend. This is a validation step before real generated-frame scheduling; it does not yet inject additional presented frames.
+The DX12 path now includes an experimental generated-frame presentation mode. Press F5 to toggle it. F4 remains the safer interpolation preview mode that blends history into the real frame without inserting an extra Present.
+
+Suggested commit name for this update: `Add FSR1 pass and experimental generated frame presentation`
