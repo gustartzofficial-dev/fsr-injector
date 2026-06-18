@@ -185,3 +185,22 @@ Commit suggestion: `Add DX12 FPS counter and stabilize generated-frame menu`
   - `FPS OUT` = estimated output present rate including experimental generated Presents.
 - Keeps the native menu visible on generated frames too, reducing the visible menu flicker when F5 generated-frame presentation is enabled.
 - Throttles generated-frame presentation logging so the log does not spam every generated frame.
+
+## Generic resource scout v0
+
+This build adds the first universal catcher/scout layer. It is deliberately generic and does not require a game-specific plugin.
+
+Current scout sources:
+
+- DX12 swapchain/final-frame capture status.
+- DX12 frame-history readiness.
+- Final-frame optical-flow-lite availability for motion interpolation.
+- Existing DX11 depth-buffer heuristic status from the D3D11 OMSetRenderTargets hook.
+
+The native DX12 menu now shows:
+
+- `SCOUT ON`
+- `MV OFLOW` when final-frame optical-flow-lite is the active generic motion source.
+- `DEPTH YES/NO` when the generic DX11 depth heuristic has found a depth candidate.
+
+This is the foundation for a universal capture layer. It does not yet extract true game motion vectors from arbitrary DX11/DX12 games. The next upgrades should add generic DX12 depth/RTV scouting by hooking D3D12 command-list creation and selected command-list methods, then velocity-buffer candidate detection from render-target formats and usage patterns.

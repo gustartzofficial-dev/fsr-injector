@@ -160,3 +160,7 @@ Controls:
 - `End`: toggle DX12 post-process
 - `F4`: preview interpolation inside real frames
 - `F5`: experimental generated-frame presentation
+
+### Generic resource scout
+
+The injector now includes a first universal resource scout layer. It reports whether the current DX12 path is using final-frame optical-flow-lite motion and whether the generic DX11 depth-buffer heuristic has found a likely depth target. This is intended as the base for universal depth/motion-vector detection before adding optional game-specific companion plugins.
