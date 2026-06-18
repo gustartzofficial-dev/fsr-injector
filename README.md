@@ -160,7 +160,3 @@ Controls:
 - `End`: toggle DX12 post-process
 - `F4`: preview interpolation inside real frames
 - `F5`: experimental generated-frame presentation
-
-### DX12 FSR3-lite experiment
-
-The DX12 backend includes an experimental final-frame optical-flow-lite interpolation mode. It uses previous/current swapchain frames to estimate motion and is intended as a stepping stone toward real FSR3-style frame generation. It does not yet use native game motion vectors/depth.
