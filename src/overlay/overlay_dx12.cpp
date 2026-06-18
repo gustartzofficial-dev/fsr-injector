@@ -39,6 +39,15 @@ namespace {
     WNDPROC g_orig_wndproc = nullptr;
     detect::DetectResult g_profile;
     bool g_profile_done = false;
+    bool g_render_enabled = false;
+
+    bool env_enabled(const wchar_t* name) {
+        wchar_t value[16]{};
+        DWORD n = GetEnvironmentVariableW(name, value, 16);
+        if (n == 0 || n >= 16) return false;
+        return value[0] == L'1' || value[0] == L'y' || value[0] == L'Y' ||
+               value[0] == L't' || value[0] == L'T';
+    }
 
     LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (core::config().overlay_visible.load() && ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp))
@@ -127,6 +136,18 @@ namespace {
         sc->GetDesc(&desc);
         g_hwnd = desc.OutputWindow;
 
+        // Safety gate: several DX12 games crash if we submit our own command list
+        // without a full allocator/fence/backbuffer-state tracking path. Keep DX12
+        // queue capture alive by default, but do not render the overlay unless the
+        // tester explicitly opts in with FSRINJ_DX12_OVERLAY=1.
+        g_render_enabled = env_enabled(L"FSRINJ_DX12_OVERLAY");
+        if (!g_render_enabled) {
+            LOGF("[overlay-dx12] safe mode: render disabled; set FSRINJ_DX12_OVERLAY=1 to test overlay drawing");
+            LOGF("[overlay-dx12] initialized on hwnd %p queue=%p", static_cast<void*>(g_hwnd),
+                 static_cast<void*>(g_queue));
+            return true;
+        }
+
         D3D12_DESCRIPTOR_HEAP_DESC srv_desc{};
         srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srv_desc.NumDescriptors = 1;
@@ -164,6 +185,7 @@ bool on_present(IDXGISwapChain* sc) {
     }
     prev = down;
 
+    if (!g_render_enabled) return true;
     if (!core::config().overlay_visible.load()) return true;
 
     const UINT idx = g_sc3 ? g_sc3->GetCurrentBackBufferIndex() : 0;
@@ -208,7 +230,7 @@ void on_after_resize(IDXGISwapChain* sc) { if (g_init && g_dev) create_render_ta
 
 void shutdown() {
     if (g_hwnd && g_orig_wndproc) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_orig_wndproc);
-    if (g_init) {
+    if (g_init && g_render_enabled) {
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();
         if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
@@ -218,6 +240,7 @@ void shutdown() {
     if (g_queue) { g_queue->Release(); g_queue = nullptr; }
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
     if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
+    g_render_enabled = false;
     g_init = false;
 }
 

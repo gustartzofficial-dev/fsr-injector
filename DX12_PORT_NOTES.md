@@ -35,3 +35,14 @@ Use a simple DX12 sample/game first. Check the log for:
 - `[overlay-dx12] initialized ...`
 
 If the queue is not captured, the game may be creating the swapchain before the proxy has installed factory hooks, or through an unusual DXGI path that needs another hook.
+
+## DX12 crash safe-mode patch
+
+Some DX12 games close immediately after the first DX12 overlay initialization if the injector submits its own ImGui command list without full fence/allocator/backbuffer-state tracking. The DX12 path now defaults to a safe mode:
+
+- DX12 swapchain detection remains enabled.
+- ID3D12CommandQueue capture remains enabled.
+- DX12 overlay rendering is skipped by default.
+- Set `FSRINJ_DX12_OVERLAY=1` before launching the game to opt into the experimental DX12 overlay renderer.
+
+This is intentional. The next DX12 rendering patch should add proper per-frame fences, allocator retirement, and conservative backbuffer state handling before enabling overlay/upscaler rendering by default.
