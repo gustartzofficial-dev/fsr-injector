@@ -46,3 +46,20 @@ Some DX12 games close immediately after the first DX12 overlay initialization if
 - Set `FSRINJ_DX12_OVERLAY=1` before launching the game to opt into the experimental DX12 overlay renderer.
 
 This is intentional. The next DX12 rendering patch should add proper per-frame fences, allocator retirement, and conservative backbuffer state handling before enabling overlay/upscaler rendering by default.
+
+## DX12 overlay render stabilization patch
+
+The previous safe-mode build disabled DX12 overlay drawing to prove that the crash was in command submission rather than in queue/swapchain capture. This patch re-enables DX12 overlay drawing by default and adds the missing synchronization pieces:
+
+- one command allocator per swapchain backbuffer
+- one fence value per backbuffer/frame context
+- fence wait before resetting a command allocator
+- queue signal after our overlay command list is submitted
+- GPU idle wait before ResizeBuffers resource release and shutdown
+- detailed HRESULT logging for DX12 overlay initialization and render failures
+
+To temporarily disable only DX12 overlay drawing while keeping queue capture active, launch with:
+
+```bat
+set FSRINJ_DX12_OVERLAY=0
+```

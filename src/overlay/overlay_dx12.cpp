@@ -23,6 +23,7 @@ namespace {
         ID3D12CommandAllocator* allocator = nullptr;
         ID3D12Resource* backbuffer = nullptr;
         D3D12_CPU_DESCRIPTOR_HANDLE rtv{};
+        UINT64 fence_value = 0;
     };
 
     bool g_init = false;
@@ -32,6 +33,9 @@ namespace {
     ID3D12DescriptorHeap* g_rtv_heap = nullptr;
     ID3D12DescriptorHeap* g_srv_heap = nullptr;
     ID3D12GraphicsCommandList* g_cmd = nullptr;
+    ID3D12Fence* g_fence = nullptr;
+    HANDLE g_fence_event = nullptr;
+    UINT64 g_next_fence_value = 1;
     std::vector<FrameContext> g_frames;
     UINT g_rtv_stride = 0;
     DXGI_FORMAT g_format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -39,14 +43,14 @@ namespace {
     WNDPROC g_orig_wndproc = nullptr;
     detect::DetectResult g_profile;
     bool g_profile_done = false;
-    bool g_render_enabled = false;
+    bool g_render_enabled = true;
 
-    bool env_enabled(const wchar_t* name) {
+    bool env_disabled(const wchar_t* name) {
         wchar_t value[16]{};
         DWORD n = GetEnvironmentVariableW(name, value, 16);
         if (n == 0 || n >= 16) return false;
-        return value[0] == L'1' || value[0] == L'y' || value[0] == L'Y' ||
-               value[0] == L't' || value[0] == L'T';
+        return value[0] == L'0' || value[0] == L'n' || value[0] == L'N' ||
+               value[0] == L'f' || value[0] == L'F';
     }
 
     LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -55,10 +59,51 @@ namespace {
         return CallWindowProcW(g_orig_wndproc, hwnd, msg, wp, lp);
     }
 
+    bool wait_for_fence(UINT64 value) {
+        if (!g_fence || value == 0) return true;
+        if (g_fence->GetCompletedValue() >= value) return true;
+        HRESULT hr = g_fence->SetEventOnCompletion(value, g_fence_event);
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] SetEventOnCompletion failed hr=0x%08lX", hr);
+            return false;
+        }
+        WaitForSingleObject(g_fence_event, 2000);
+        return g_fence->GetCompletedValue() >= value;
+    }
+
+    bool wait_for_frame(FrameContext& f) {
+        if (!wait_for_fence(f.fence_value)) {
+            LOGF("[overlay-dx12] fence wait timed out; skipping this frame");
+            return false;
+        }
+        f.fence_value = 0;
+        return true;
+    }
+
+    void signal_frame(FrameContext& f) {
+        if (!g_queue || !g_fence) return;
+        const UINT64 value = g_next_fence_value++;
+        HRESULT hr = g_queue->Signal(g_fence, value);
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] queue Signal failed hr=0x%08lX", hr);
+            return;
+        }
+        f.fence_value = value;
+    }
+
+    void wait_for_gpu_idle() {
+        if (!g_queue || !g_fence) return;
+        const UINT64 value = g_next_fence_value++;
+        if (SUCCEEDED(g_queue->Signal(g_fence, value))) wait_for_fence(value);
+        for (auto& f : g_frames) f.fence_value = 0;
+    }
+
     void release_frame_resources() {
+        wait_for_gpu_idle();
         for (auto& f : g_frames) {
             if (f.backbuffer) { f.backbuffer->Release(); f.backbuffer = nullptr; }
             if (f.allocator) { f.allocator->Release(); f.allocator = nullptr; }
+            f.fence_value = 0;
         }
         g_frames.clear();
         if (g_cmd) { g_cmd->Release(); g_cmd = nullptr; }
@@ -89,42 +134,69 @@ namespace {
         if (ImGui::Checkbox("Enable frame generation", &fg)) cfg.framegen_enabled.store(fg);
         ImGui::Text("Real frames:      %llu", (unsigned long long)framegen::real_frames());
         ImGui::Text("Generated frames: %llu", (unsigned long long)framegen::generated_frames());
-        ImGui::TextDisabled("DX12 path: overlay + queue capture active; FSR3/FidelityFX wiring is next.");
+        ImGui::TextDisabled("DX12 overlay is active. DX12 FSR/sharpen/framegen render passes are not wired yet.");
 
         ImGui::End();
     }
 
     bool create_render_targets(IDXGISwapChain* sc) {
         DXGI_SWAP_CHAIN_DESC desc{};
-        if (FAILED(sc->GetDesc(&desc))) return false;
+        HRESULT hr = sc->GetDesc(&desc);
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] GetDesc failed hr=0x%08lX", hr);
+            return false;
+        }
         g_format = desc.BufferDesc.Format == DXGI_FORMAT_UNKNOWN ? DXGI_FORMAT_R8G8B8A8_UNORM : desc.BufferDesc.Format;
         const UINT buffer_count = desc.BufferCount ? desc.BufferCount : 2;
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
         rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         rtv_desc.NumDescriptors = buffer_count;
-        if (FAILED(g_dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&g_rtv_heap)))) return false;
+        hr = g_dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&g_rtv_heap));
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] CreateDescriptorHeap(RTV) failed hr=0x%08lX", hr);
+            return false;
+        }
         g_rtv_stride = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
         g_frames.resize(buffer_count);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
         for (UINT i = 0; i < buffer_count; ++i) {
             g_frames[i].rtv = cpu;
-            if (FAILED(sc->GetBuffer(i, IID_PPV_ARGS(&g_frames[i].backbuffer)))) return false;
+            hr = sc->GetBuffer(i, IID_PPV_ARGS(&g_frames[i].backbuffer));
+            if (FAILED(hr)) {
+                LOGF("[overlay-dx12] GetBuffer(%u) failed hr=0x%08lX", i, hr);
+                return false;
+            }
             g_dev->CreateRenderTargetView(g_frames[i].backbuffer, nullptr, cpu);
-            if (FAILED(g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_frames[i].allocator)))) return false;
+            hr = g_dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_frames[i].allocator));
+            if (FAILED(hr)) {
+                LOGF("[overlay-dx12] CreateCommandAllocator(%u) failed hr=0x%08lX", i, hr);
+                return false;
+            }
             cpu.ptr += g_rtv_stride;
         }
 
-        if (FAILED(g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_cmd))))
+        hr = g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_cmd));
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] CreateCommandList failed hr=0x%08lX", hr);
             return false;
+        }
         g_cmd->Close();
         return true;
     }
 
     bool init(IDXGISwapChain* sc) {
-        if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&g_sc3))) || !g_sc3) return false;
-        if (FAILED(sc->GetDevice(IID_PPV_ARGS(&g_dev))) || !g_dev) return false;
+        HRESULT hr = sc->QueryInterface(IID_PPV_ARGS(&g_sc3));
+        if (FAILED(hr) || !g_sc3) {
+            LOGF("[overlay-dx12] QueryInterface(IDXGISwapChain3) failed hr=0x%08lX", hr);
+            return false;
+        }
+        hr = sc->GetDevice(IID_PPV_ARGS(&g_dev));
+        if (FAILED(hr) || !g_dev) {
+            LOGF("[overlay-dx12] GetDevice(ID3D12Device) failed hr=0x%08lX", hr);
+            return false;
+        }
 
         g_queue = hooks::dx12::queue_for_swapchain(sc);
         if (!g_queue) {
@@ -136,13 +208,9 @@ namespace {
         sc->GetDesc(&desc);
         g_hwnd = desc.OutputWindow;
 
-        // Safety gate: several DX12 games crash if we submit our own command list
-        // without a full allocator/fence/backbuffer-state tracking path. Keep DX12
-        // queue capture alive by default, but do not render the overlay unless the
-        // tester explicitly opts in with FSRINJ_DX12_OVERLAY=1.
-        g_render_enabled = env_enabled(L"FSRINJ_DX12_OVERLAY");
+        g_render_enabled = !env_disabled(L"FSRINJ_DX12_OVERLAY");
         if (!g_render_enabled) {
-            LOGF("[overlay-dx12] safe mode: render disabled; set FSRINJ_DX12_OVERLAY=1 to test overlay drawing");
+            LOGF("[overlay-dx12] render disabled by FSRINJ_DX12_OVERLAY=0");
             LOGF("[overlay-dx12] initialized on hwnd %p queue=%p", static_cast<void*>(g_hwnd),
                  static_cast<void*>(g_queue));
             return true;
@@ -152,7 +220,22 @@ namespace {
         srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srv_desc.NumDescriptors = 1;
         srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        if (FAILED(g_dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_srv_heap)))) return false;
+        hr = g_dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_srv_heap));
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] CreateDescriptorHeap(SRV) failed hr=0x%08lX", hr);
+            return false;
+        }
+
+        hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] CreateFence failed hr=0x%08lX", hr);
+            return false;
+        }
+        g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!g_fence_event) {
+            LOGF("[overlay-dx12] CreateEvent failed err=%lu", GetLastError());
+            return false;
+        }
 
         if (!create_render_targets(sc)) return false;
 
@@ -165,8 +248,8 @@ namespace {
                             g_srv_heap->GetGPUDescriptorHandleForHeapStart());
 
         g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)wndproc);
-        LOGF("[overlay-dx12] initialized on hwnd %p buffers=%u queue=%p", static_cast<void*>(g_hwnd),
-             (unsigned)g_frames.size(), static_cast<void*>(g_queue));
+        LOGF("[overlay-dx12] initialized on hwnd %p buffers=%u format=%u queue=%p", static_cast<void*>(g_hwnd),
+             (unsigned)g_frames.size(), (unsigned)g_format, static_cast<void*>(g_queue));
         return true;
     }
 }
@@ -191,9 +274,19 @@ bool on_present(IDXGISwapChain* sc) {
     const UINT idx = g_sc3 ? g_sc3->GetCurrentBackBufferIndex() : 0;
     if (idx >= g_frames.size()) return true;
     FrameContext& f = g_frames[idx];
+    if (!f.allocator || !f.backbuffer || !g_cmd || !g_queue) return true;
+    if (!wait_for_frame(f)) return true;
 
-    f.allocator->Reset();
-    g_cmd->Reset(f.allocator, nullptr);
+    HRESULT hr = f.allocator->Reset();
+    if (FAILED(hr)) {
+        LOGF("[overlay-dx12] allocator Reset failed hr=0x%08lX", hr);
+        return true;
+    }
+    hr = g_cmd->Reset(f.allocator, nullptr);
+    if (FAILED(hr)) {
+        LOGF("[overlay-dx12] command list Reset failed hr=0x%08lX", hr);
+        return true;
+    }
 
     D3D12_RESOURCE_BARRIER b1{};
     b1.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -218,29 +311,43 @@ bool on_present(IDXGISwapChain* sc) {
     b2.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b2.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     g_cmd->ResourceBarrier(1, &b2);
-    g_cmd->Close();
+
+    hr = g_cmd->Close();
+    if (FAILED(hr)) {
+        LOGF("[overlay-dx12] command list Close failed hr=0x%08lX", hr);
+        return true;
+    }
 
     ID3D12CommandList* lists[] = { g_cmd };
     g_queue->ExecuteCommandLists(1, lists);
+    signal_frame(f);
     return true;
 }
 
 void on_resize_buffers() { release_frame_resources(); }
-void on_after_resize(IDXGISwapChain* sc) { if (g_init && g_dev) create_render_targets(sc); }
+void on_after_resize(IDXGISwapChain* sc) {
+    if (g_init && g_dev && g_render_enabled) {
+        if (!create_render_targets(sc)) LOGF("[overlay-dx12] recreate render targets failed after ResizeBuffers");
+    }
+}
 
 void shutdown() {
     if (g_hwnd && g_orig_wndproc) SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_orig_wndproc);
     if (g_init && g_render_enabled) {
+        wait_for_gpu_idle();
         ImGui_ImplDX12_Shutdown();
         ImGui_ImplWin32_Shutdown();
         if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
     }
     release_frame_resources();
+    if (g_fence_event) { CloseHandle(g_fence_event); g_fence_event = nullptr; }
+    if (g_fence) { g_fence->Release(); g_fence = nullptr; }
     if (g_srv_heap) { g_srv_heap->Release(); g_srv_heap = nullptr; }
     if (g_queue) { g_queue->Release(); g_queue = nullptr; }
     if (g_dev) { g_dev->Release(); g_dev = nullptr; }
     if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
-    g_render_enabled = false;
+    g_next_fence_value = 1;
+    g_render_enabled = true;
     g_init = false;
 }
 
