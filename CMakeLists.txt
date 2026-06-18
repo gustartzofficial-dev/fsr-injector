@@ -51,6 +51,7 @@ add_library(fsr_proxy SHARED
     src/hooks/swapchain_hook.cpp
     src/hooks/depth_hook.cpp
     src/hooks/dx12_queue_capture.cpp
+    src/capture/generic_resource_scout.cpp
     src/overlay/overlay.cpp
     src/overlay/overlay_dx12.cpp
     src/detect/upscaler_detect.cpp

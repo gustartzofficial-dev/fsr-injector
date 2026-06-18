@@ -160,3 +160,7 @@ Controls:
 - `End`: toggle DX12 post-process
 - `F4`: preview interpolation inside real frames
 - `F5`: experimental generated-frame presentation
+
+### Generic Resource Scout v1
+
+The DX12 scout now hooks command queues, command lists, RTV/DSV descriptor creation, render-target binding, barriers, and draw calls. It reports candidate depth and motion-vector-like resources in the log and menu. This is a discovery layer only; candidates are not yet consumed by the frame-generation shader.

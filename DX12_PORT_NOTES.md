@@ -185,3 +185,27 @@ Commit suggestion: `Add DX12 FPS counter and stabilize generated-frame menu`
   - `FPS OUT` = estimated output present rate including experimental generated Presents.
 - Keeps the native menu visible on generated frames too, reducing the visible menu flicker when F5 generated-frame presentation is enabled.
 - Throttles generated-frame presentation logging so the log does not spam every generated frame.
+
+## Generic Resource Scout v1
+
+This version moves the scout from status-only into active DX12 resource candidate tracking.
+
+New DX12 hooks:
+
+- `ID3D12CommandQueue::ExecuteCommandLists`
+- `ID3D12Device::CreateRenderTargetView`
+- `ID3D12Device::CreateDepthStencilView`
+- `ID3D12GraphicsCommandList::OMSetRenderTargets`
+- `ID3D12GraphicsCommandList::ResourceBarrier`
+- `ID3D12GraphicsCommandList::DrawInstanced`
+- `ID3D12GraphicsCommandList::DrawIndexedInstanced`
+
+The scout now counts render-target descriptors, depth-stencil descriptors, draw calls, barriers, OM depth binds, and likely depth/motion candidates. This is still heuristic detection. It does not yet feed a discovered depth or motion-vector texture into the frame generation shader.
+
+Expected log lines after some gameplay:
+
+```text
+[scout-dx12] cmdlists=... exec=... draws=... barriers=... rtv=... dsv=... omrt=... omdsv=... depthCand=... bestDepth=... mvCand=... bestMV=...
+```
+
+If `depthCand` stays at zero, the next scout step is descriptor-heap scanning or device-resource creation hooks. If `mvCand` stays zero, the game may not render velocity buffers at all, which is common for older/non-upscaler games.

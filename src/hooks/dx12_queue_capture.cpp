@@ -1,5 +1,6 @@
 #include "hooks/dx12_queue_capture.h"
 #include "core/log.h"
+#include "capture/generic_resource_scout.h"
 
 #include <windows.h>
 #include <dxgi.h>
@@ -23,6 +24,23 @@ namespace {
     CreateSwapChainForCoreWindowFn  g_orig_create_for_core = nullptr;
     CreateSwapChainForCompositionFn g_orig_create_for_composition = nullptr;
 
+
+    using ExecuteCommandListsFn = void (STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+    using CreateRenderTargetViewFn = void (STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    using CreateDepthStencilViewFn = void (STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    using ResourceBarrierFn = void (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+    using OMSetRenderTargetsFn = void (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+    using DrawInstancedFn = void (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+    using DrawIndexedInstancedFn = void (STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+
+    ExecuteCommandListsFn g_orig_execute_command_lists = nullptr;
+    CreateRenderTargetViewFn g_orig_create_rtv = nullptr;
+    CreateDepthStencilViewFn g_orig_create_dsv = nullptr;
+    ResourceBarrierFn g_orig_resource_barrier = nullptr;
+    OMSetRenderTargetsFn g_orig_omset_render_targets = nullptr;
+    DrawInstancedFn g_orig_draw_instanced = nullptr;
+    DrawIndexedInstancedFn g_orig_draw_indexed_instanced = nullptr;
+
     std::mutex g_mtx;
     std::unordered_map<IDXGISwapChain*, ID3D12CommandQueue*> g_queues;
     std::unordered_set<void*> g_hooked_targets;
@@ -32,6 +50,101 @@ namespace {
         return s == MH_OK || s == MH_ERROR_ALREADY_INITIALIZED;
     }
 
+    template <class Fn>
+    void hook_once(void* target, void* detour, Fn* original, const char* name) {
+        if (!target) return;
+        std::lock_guard<std::mutex> lk(g_mtx);
+        if (g_hooked_targets.contains(target)) return;
+        if (MH_CreateHook(target, detour, reinterpret_cast<void**>(original)) == MH_OK) {
+            g_hooked_targets.insert(target);
+            MH_EnableHook(target);
+            LOGF("[dx12] hooked %s", name);
+        }
+    }
+
+
+
+    void STDMETHODCALLTYPE hk_CreateRenderTargetView(ID3D12Device* device, ID3D12Resource* resource,
+                                                     const D3D12_RENDER_TARGET_VIEW_DESC* desc,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+        capture::scout::note_dx12_rtv_descriptor(handle, resource, desc);
+        g_orig_create_rtv(device, resource, desc, handle);
+    }
+
+    void STDMETHODCALLTYPE hk_CreateDepthStencilView(ID3D12Device* device, ID3D12Resource* resource,
+                                                     const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
+                                                     D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+        capture::scout::note_dx12_dsv_descriptor(handle, resource, desc);
+        g_orig_create_dsv(device, resource, desc, handle);
+    }
+
+    void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT count,
+                                              const D3D12_RESOURCE_BARRIER* barriers) {
+        capture::scout::note_dx12_resource_barrier(count);
+        g_orig_resource_barrier(list, count, barriers);
+    }
+
+    void STDMETHODCALLTYPE hk_OMSetRenderTargets(ID3D12GraphicsCommandList* list, UINT num_rt,
+                                                 const D3D12_CPU_DESCRIPTOR_HANDLE* rt_handles,
+                                                 BOOL single_handle,
+                                                 const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_handle) {
+        capture::scout::note_dx12_omset(num_rt, rt_handles, dsv_handle);
+        g_orig_omset_render_targets(list, num_rt, rt_handles, single_handle, dsv_handle);
+    }
+
+    void STDMETHODCALLTYPE hk_DrawInstanced(ID3D12GraphicsCommandList* list, UINT vertex_count, UINT instance_count,
+                                           UINT start_vertex, UINT start_instance) {
+        capture::scout::note_dx12_draw_call(false);
+        g_orig_draw_instanced(list, vertex_count, instance_count, start_vertex, start_instance);
+    }
+
+    void STDMETHODCALLTYPE hk_DrawIndexedInstanced(ID3D12GraphicsCommandList* list, UINT index_count, UINT instance_count,
+                                                  UINT start_index, INT base_vertex, UINT start_instance) {
+        capture::scout::note_dx12_draw_call(true);
+        g_orig_draw_indexed_instanced(list, index_count, instance_count, start_index, base_vertex, start_instance);
+    }
+
+    void hook_device_views(ID3D12Device* device) {
+        if (!device) return;
+        void** vt = *reinterpret_cast<void***>(device);
+        // ID3D12Device vtable slots: 20=CreateRenderTargetView, 21=CreateDepthStencilView.
+        hook_once(vt[20], reinterpret_cast<void*>(&hk_CreateRenderTargetView), &g_orig_create_rtv, "ID3D12Device::CreateRenderTargetView");
+        hook_once(vt[21], reinterpret_cast<void*>(&hk_CreateDepthStencilView), &g_orig_create_dsv, "ID3D12Device::CreateDepthStencilView");
+    }
+
+    void hook_graphics_command_list(ID3D12GraphicsCommandList* list) {
+        if (!list) return;
+        capture::scout::note_dx12_command_list_seen();
+        void** vt = *reinterpret_cast<void***>(list);
+        // ID3D12GraphicsCommandList slots.
+        hook_once(vt[10], reinterpret_cast<void*>(&hk_DrawInstanced), &g_orig_draw_instanced, "ID3D12GraphicsCommandList::DrawInstanced");
+        hook_once(vt[11], reinterpret_cast<void*>(&hk_DrawIndexedInstanced), &g_orig_draw_indexed_instanced, "ID3D12GraphicsCommandList::DrawIndexedInstanced");
+        hook_once(vt[24], reinterpret_cast<void*>(&hk_ResourceBarrier), &g_orig_resource_barrier, "ID3D12GraphicsCommandList::ResourceBarrier");
+        hook_once(vt[44], reinterpret_cast<void*>(&hk_OMSetRenderTargets), &g_orig_omset_render_targets, "ID3D12GraphicsCommandList::OMSetRenderTargets");
+    }
+
+    void STDMETHODCALLTYPE hk_ExecuteCommandLists(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+        capture::scout::note_dx12_execute_call(count);
+        if (lists) {
+            for (UINT i = 0; i < count; ++i) {
+                ID3D12GraphicsCommandList* gl = nullptr;
+                if (lists[i] && SUCCEEDED(lists[i]->QueryInterface(__uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&gl))) && gl) {
+                    hook_graphics_command_list(gl);
+                    gl->Release();
+                }
+            }
+        }
+        capture::scout::log_dx12_candidates_periodic();
+        g_orig_execute_command_lists(queue, count, lists);
+    }
+
+    void hook_queue_execute(ID3D12CommandQueue* queue) {
+        if (!queue) return;
+        void** vt = *reinterpret_cast<void***>(queue);
+        // ID3D12CommandQueue::ExecuteCommandLists = slot 8.
+        hook_once(vt[8], reinterpret_cast<void*>(&hk_ExecuteCommandLists), &g_orig_execute_command_lists, "ID3D12CommandQueue::ExecuteCommandLists");
+    }
+
     void remember_queue(IUnknown* maybe_queue, IDXGISwapChain* sc) {
         if (!maybe_queue || !sc) return;
 
@@ -39,11 +152,20 @@ namespace {
         if (FAILED(maybe_queue->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&q))) || !q)
             return; // D3D11 path passes a device here, not a D3D12 queue.
 
-        std::lock_guard<std::mutex> lk(g_mtx);
-        auto it = g_queues.find(sc);
-        if (it != g_queues.end() && it->second) it->second->Release();
-        g_queues[sc] = q; // keep the AddRef from QueryInterface
+        {
+            std::lock_guard<std::mutex> lk(g_mtx);
+            auto it = g_queues.find(sc);
+            if (it != g_queues.end() && it->second) it->second->Release();
+            g_queues[sc] = q; // keep the AddRef from QueryInterface
+        }
         LOGF("[dx12] captured ID3D12CommandQueue %p for swapchain %p", static_cast<void*>(q), static_cast<void*>(sc));
+
+        hook_queue_execute(q);
+        ID3D12Device* dev = nullptr;
+        if (SUCCEEDED(q->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) && dev) {
+            hook_device_views(dev);
+            dev->Release();
+        }
     }
 
     HRESULT STDMETHODCALLTYPE hk_CreateSwapChain(IDXGIFactory* factory, IUnknown* device,
@@ -82,17 +204,6 @@ namespace {
         return hr;
     }
 
-    template <class Fn>
-    void hook_once(void* target, void* detour, Fn* original, const char* name) {
-        if (!target) return;
-        std::lock_guard<std::mutex> lk(g_mtx);
-        if (g_hooked_targets.contains(target)) return;
-        if (MH_CreateHook(target, detour, reinterpret_cast<void**>(original)) == MH_OK) {
-            g_hooked_targets.insert(target);
-            MH_EnableHook(target);
-            LOGF("[dx12] hooked %s", name);
-        }
-    }
 }
 
 bool install_factory_hooks(IUnknown* factory_unknown) {
