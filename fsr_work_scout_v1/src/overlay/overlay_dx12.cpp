@@ -2,6 +2,7 @@
 #include "hooks/dx12_queue_capture.h"
 #include "core/config.h"
 #include "core/log.h"
+#include "capture/generic_resource_scout.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -218,7 +219,7 @@ namespace {
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[1].Constants.ShaderRegister = 0;
         params[1].Constants.RegisterSpace = 0;
-        params[1].Constants.Num32BitValues = 13;
+        params[1].Constants.Num32BitValues = 16;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -281,6 +282,9 @@ cbuffer Params : register(b0) {
     float genPresentOn;
     float realFps;
     float outputFps;
+    float scoutOn;
+    float scoutDepth;
+    float scoutMotion;
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -434,7 +438,7 @@ float number3_pixel(float value, float2 pos, float2 origin, float scale_px) {
 float3 draw_native_ui(float3 color, float2 pos) {
     if (overlayOn < 0.5) return color;
     float2 panelMin = float2(14.0, 14.0);
-    float2 panelMax = float2(306.0, 224.0);
+    float2 panelMax = float2(306.0, 286.0);
     float inside = step(panelMin.x, pos.x) * step(panelMin.y, pos.y) * step(pos.x, panelMax.x) * step(pos.y, panelMax.y);
     color = lerp(color, float3(0.025, 0.025, 0.032), inside * 0.72);
     float border = inside * (1.0 - step(panelMin.x + 2.0, pos.x) * step(panelMin.y + 2.0, pos.y) * step(pos.x, panelMax.x - 2.0) * step(pos.y, panelMax.y - 2.0));
@@ -457,6 +461,12 @@ float3 draw_native_ui(float3 color, float2 pos) {
     white = max(white, number3_pixel(realFps, pos, o + float2(132, 162), 2.0));
     white = max(white, text_pixel(70,80,83,32,79,85,84,32,32,32,32,32, pos, o + float2(0, 186), 2.0)); // FPS OUT
     white = max(white, number3_pixel(outputFps, pos, o + float2(132, 186), 2.0));
+    if (scoutOn > 0.5) white = max(white, text_pixel(83,67,79,85,84,32,79,78,32,32,32,32, pos, o + float2(0, 210), 2.0)); // SCOUT ON
+    else white = max(white, text_pixel(83,67,79,85,84,32,79,70,70,32,32,32, pos, o + float2(0, 210), 2.0)); // SCOUT OFF
+    if (scoutMotion > 0.5) white = max(white, text_pixel(77,86,32,67,65,78,68,32,32,32,32,32, pos, o + float2(0, 234), 2.0)); // MV CAND
+    else white = max(white, text_pixel(77,86,32,78,79,78,69,32,32,32,32,32, pos, o + float2(0, 234), 2.0)); // MV NONE
+    if (scoutDepth > 0.5) white = max(white, text_pixel(68,69,80,84,72,32,89,69,83,32,32,32, pos, o + float2(0, 258), 2.0)); // DEPTH YES
+    else white = max(white, text_pixel(68,69,80,84,72,32,78,79,32,32,32,32, pos, o + float2(0, 258), 2.0)); // DEPTH NO
     color = lerp(color, float3(0.92, 0.92, 0.95), white);
 
     float scaleBg = step(98.0, pos.x) * step(72.0, pos.y) * step(pos.x, 226.0) * step(pos.y, 78.0);
@@ -840,6 +850,10 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
 
         if (!create_render_targets(sc)) return false;
 
+        capture::scout::note_dx12_swapchain(g_width, g_height, g_format);
+        capture::scout::note_final_frame_motion(true);
+        capture::scout::log_snapshot_once();
+
         LOGF("[overlay-dx12] FSR1-style EASU/RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off");
@@ -863,7 +877,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                ID3D12PipelineState* pso,
                                float inv_x, float inv_y, float sharpness, float scale,
                                bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled, bool gen_present_enabled,
-                               float real_fps, float output_fps) {
+                               float real_fps, float output_fps, float /*scout_on_arg*/, float /*scout_depth_arg*/, float /*scout_motion_arg*/) {
         D3D12_VIEWPORT vp{};
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
@@ -881,8 +895,11 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_cmd->SetPipelineState(pso);
         g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_cmd->SetGraphicsRootDescriptorTable(0, srv_gpu(0));
-        const float params[13] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f, real_fps, output_fps };
-        g_cmd->SetGraphicsRoot32BitConstants(1, 13, params, 0);
+        auto scout = capture::scout::snapshot();
+        const bool scout_depth_ready = scout.dx11_depth_found || scout.dx12_depth_candidates > 0;
+        const bool scout_motion_ready = scout.dx12_motion_candidates > 0 || scout.final_frame_motion;
+        const float params[16] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f, real_fps, output_fps, scout.enabled ? 1.0f : 0.0f, scout_depth_ready ? 1.0f : 0.0f, scout_motion_ready ? 1.0f : 0.0f };
+        g_cmd->SetGraphicsRoot32BitConstants(1, 16, params, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
     }
 
@@ -906,7 +923,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso,
                                   1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
                                   g_sharpness, g_scale, false, true, g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps);
+                                  g_real_fps, g_output_fps, 1.0f, 0.0f, 1.0f);
             transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             final_inv_x = 1.0f / static_cast<float>(g_low_width);
@@ -920,7 +937,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                   final_inv_x, final_inv_y,
                                   g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
                                   g_history_ready, true, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps);
+                                  g_real_fps, g_output_fps, 1.0f, 0.0f, 1.0f);
             transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_generated_ready = true;
@@ -933,7 +950,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                               final_inv_x, final_inv_y,
                               g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
                               g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                              g_real_fps, g_output_fps);
+                              g_real_fps, g_output_fps, 1.0f, 0.0f, 1.0f);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g_input_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         transition(g_cmd, g_history, g_history_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -942,6 +959,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         transition(g_cmd, g_history, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         g_history_ready = true;
+        capture::scout::note_dx12_history(true);
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         return true;
