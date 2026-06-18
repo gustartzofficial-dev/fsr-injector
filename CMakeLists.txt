@@ -40,6 +40,7 @@ target_include_directories(imgui PUBLIC
     ${imgui_SOURCE_DIR}
     ${imgui_SOURCE_DIR}/backends
 )
+target_compile_definitions(imgui PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
 
 # --- Our proxy DLL ---
 # Target is named "fsr_proxy" to avoid colliding with the system "dxgi" import
@@ -60,6 +61,7 @@ add_library(fsr_proxy SHARED
 )
 
 target_include_directories(fsr_proxy PRIVATE src)
+target_compile_definitions(fsr_proxy PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(fsr_proxy PRIVATE minhook imgui d3d11 d3d12 dxgi dxguid dwmapi d3dcompiler)
 
 # Name the output exactly "dxgi.dll" with no "lib" prefix.

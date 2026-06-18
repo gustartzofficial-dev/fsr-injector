@@ -151,7 +151,7 @@ namespace {
         D3D11_TEXTURE2D_DESC d{}; bb->GetDesc(&d);
         if(g_prev_tex&&d.Width==g_w&&d.Height==g_h&&d.Format==g_fmt) return true;
         rel(); g_w=d.Width;g_h=d.Height;g_fmt=d.Format;
-        g_lw=std::max(1u,(g_w+kDS-1)/kDS); g_lh=std::max(1u,(g_h+kDS-1)/kDS);
+        g_lw=(std::max)(1u,(g_w+kDS-1)/kDS); g_lh=(std::max)(1u,(g_h+kDS-1)/kDS);
         if(!mk_cap(d,&g_prev_tex,&g_prev_srv))return false;
         if(!mk_cap(d,&g_curr_tex,&g_curr_srv))return false;
         if(!mk_flow(&g_flow1,&g_flow1_rtv,&g_flow1_srv))return false;
