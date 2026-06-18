@@ -53,3 +53,17 @@ Replace DX12 sharpen shader with RCAS-style pass
 Suggested commit name: `Add native DX12 settings overlay`
 
 This build keeps Dear ImGui bypassed for DX12 and draws a lightweight native D3D12 overlay directly inside the working EASU/RCAS fullscreen pass. The overlay shows the DX12 UI header, post-process status, scale, sharpness, and a small scale bar. This follows the safer path used by mature DX12 overlays: separate capture/render backend from UI state, keep per-frame synchronization, and avoid the ImGui DX12 backend until descriptor/input issues are isolated.
+
+## Suggested commit for this patch
+
+Commit name:
+
+```text
+Add DX12 frame history and experimental interpolation
+```
+
+Description:
+
+```text
+Add a DX12 frame-history texture that stores the previous captured frame and expose an F4 experimental interpolation toggle. The first interpolation mode blends previous/current frames in the post-process shader to validate history resources before implementing true generated-frame presentation.
+```

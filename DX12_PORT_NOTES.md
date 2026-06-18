@@ -132,3 +132,41 @@ Runtime toggles:
 Suggested commit name: `Add native DX12 settings overlay`
 
 This build keeps Dear ImGui bypassed for DX12 and draws a lightweight native D3D12 overlay directly inside the working EASU/RCAS fullscreen pass. The overlay shows the DX12 UI header, post-process status, scale, sharpness, and a small scale bar. This follows the safer path used by mature DX12 overlays: separate capture/render backend from UI state, keep per-frame synchronization, and avoid the ImGui DX12 backend until descriptor/input issues are isolated.
+
+## DX12 native menu controls update
+
+Suggested commit name: `Add usable DX12 native overlay controls`
+
+The DX12 native overlay now separates menu visibility from the post-process toggle:
+
+- Home: show/hide the native DX12 menu only.
+- End: enable/disable the DX12 post-process effect.
+- PageUp/PageDown: increase/decrease sharpness in 0.05 steps.
+- Insert/Delete: increase/decrease internal test scale in 0.02 steps.
+- F1: Quality preset, scale 0.77, sharpness 0.35.
+- F2: Balanced preset, scale 0.67, sharpness 0.45.
+- F3: Performance preset, scale 0.59, sharpness 0.55.
+
+When the effect is off but the menu is visible, the backend copies the original backbuffer through unchanged and draws the menu over it, avoiding the blurred low-res reconstruction path.
+
+## Experimental DX12 frame history + interpolation
+
+This build adds a first DX12 frame-history path and an experimental interpolation toggle.
+
+- A full-resolution history texture is allocated next to the existing input/low-res textures.
+- Each Present copies the current captured frame into history after the post-process pass is submitted.
+- Once history has warmed up, F4 toggles an experimental previous/current blend mode.
+- This is **not** full frame generation yet: it does not insert extra swapchain Presents or improve frame pacing. It validates the resources, barriers, and shader path needed before generated-frame scheduling is attempted.
+
+Controls:
+
+- Home: show/hide native DX12 menu
+- End: enable/disable DX12 post-process
+- PageUp/PageDown: sharpness
+- Insert/Delete: scale
+- F1/F2/F3: quality/balanced/performance presets
+- F4: experimental interpolation blend
+
+Environment:
+
+- `FSRINJ_DX12_INTERP=1` starts with interpolation enabled.

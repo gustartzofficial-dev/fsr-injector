@@ -34,6 +34,7 @@ namespace {
     ID3D12PipelineState* g_easu_rcas_pso = nullptr;
     ID3D12Resource* g_input = nullptr;
     ID3D12Resource* g_lowres = nullptr;
+    ID3D12Resource* g_history = nullptr;
     HANDLE g_fence_event = nullptr;
     UINT64 g_next_fence_value = 1;
     std::vector<FrameContext> g_frames;
@@ -44,8 +45,12 @@ namespace {
     UINT g_width = 0;
     UINT g_height = 0;
     HWND g_hwnd = nullptr;
-    bool g_sharpen_enabled = true;
+    bool g_effect_allowed = true;
+    bool g_effect_enabled = true;
+    bool g_menu_visible = true;
     bool g_logged_first_effect = false;
+    bool g_history_ready = false;
+    bool g_interpolation_enabled = false;
     float g_sharpness = 0.20f;
     float g_scale = 0.77f;
     UINT g_low_width = 0;
@@ -54,6 +59,7 @@ namespace {
     const unsigned kWarmupPresents = 3;
     D3D12_RESOURCE_STATES g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
     D3D12_RESOURCE_STATES g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_RESOURCE_STATES g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
     template <class T>
     void safe_release(T*& p) {
@@ -163,7 +169,7 @@ namespace {
     bool create_upscale_pipeline() {
         D3D12_DESCRIPTOR_RANGE range{};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 1;
+        range.NumDescriptors = 3;
         range.BaseShaderRegister = 0;
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -176,7 +182,7 @@ namespace {
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[1].Constants.ShaderRegister = 0;
         params[1].Constants.RegisterSpace = 0;
-        params[1].Constants.Num32BitValues = 8;
+        params[1].Constants.Num32BitValues = 10;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -224,6 +230,8 @@ namespace {
 
         const char* hlsl = R"HLSL(
 Texture2D<float4> gInput : register(t0);
+Texture2D<float4> gHistory : register(t1);
+Texture2D<float4> gLowres : register(t2);
 SamplerState gSampler : register(s0);
 cbuffer Params : register(b0) {
     float2 invSize;
@@ -231,7 +239,9 @@ cbuffer Params : register(b0) {
     float scale;
     float2 invOutputSize;
     float overlayOn;
-    float _pad0;
+    float effectOn;
+    float historyReady;
+    float interpOn;
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -264,11 +274,11 @@ float4 DownscalePS(VSOut i) : SV_Target {
 }
 
 float3 rcas_style(float2 uv, float2 px, float strength) {
-    float3 b = gInput.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
-    float3 d = gInput.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
-    float3 e = gInput.SampleLevel(gSampler, uv, 0.0).rgb;
-    float3 f = gInput.SampleLevel(gSampler, uv + float2(px.x, 0.0), 0.0).rgb;
-    float3 h = gInput.SampleLevel(gSampler, uv + float2(0.0, px.y), 0.0).rgb;
+    float3 b = gLowres.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
+    float3 d = gLowres.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
+    float3 e = gLowres.SampleLevel(gSampler, uv, 0.0).rgb;
+    float3 f = gLowres.SampleLevel(gSampler, uv + float2(px.x, 0.0), 0.0).rgb;
+    float3 h = gLowres.SampleLevel(gSampler, uv + float2(0.0, px.y), 0.0).rgb;
     float3 mn = min(e, min(min(b, d), min(f, h)));
     float3 mx = max(e, max(max(b, d), max(f, h)));
     float3 local_range = max(mx - mn, 1.0 / 255.0);
@@ -291,15 +301,15 @@ float3 easu_style(float2 uv) {
     // directional luma gradients to bias the upscale taps away from high-contrast
     // edges, then applies the existing RCAS-style limiter.
     float2 px = invSize;
-    float3 c = gInput.SampleLevel(gSampler, uv, 0.0).rgb;
-    float3 l = gInput.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
-    float3 r = gInput.SampleLevel(gSampler, uv + float2( px.x, 0.0), 0.0).rgb;
-    float3 u = gInput.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
-    float3 d = gInput.SampleLevel(gSampler, uv + float2(0.0,  px.y), 0.0).rgb;
-    float3 lu = gInput.SampleLevel(gSampler, uv + float2(-px.x, -px.y), 0.0).rgb;
-    float3 ru = gInput.SampleLevel(gSampler, uv + float2( px.x, -px.y), 0.0).rgb;
-    float3 ld = gInput.SampleLevel(gSampler, uv + float2(-px.x,  px.y), 0.0).rgb;
-    float3 rd = gInput.SampleLevel(gSampler, uv + float2( px.x,  px.y), 0.0).rgb;
+    float3 c = gLowres.SampleLevel(gSampler, uv, 0.0).rgb;
+    float3 l = gLowres.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
+    float3 r = gLowres.SampleLevel(gSampler, uv + float2( px.x, 0.0), 0.0).rgb;
+    float3 u = gLowres.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
+    float3 d = gLowres.SampleLevel(gSampler, uv + float2(0.0,  px.y), 0.0).rgb;
+    float3 lu = gLowres.SampleLevel(gSampler, uv + float2(-px.x, -px.y), 0.0).rgb;
+    float3 ru = gLowres.SampleLevel(gSampler, uv + float2( px.x, -px.y), 0.0).rgb;
+    float3 ld = gLowres.SampleLevel(gSampler, uv + float2(-px.x,  px.y), 0.0).rgb;
+    float3 rd = gLowres.SampleLevel(gSampler, uv + float2( px.x,  px.y), 0.0).rgb;
 
     float gx = abs(luma(l) - luma(r)) + 0.5 * abs(luma(lu + ld) - luma(ru + rd));
     float gy = abs(luma(u) - luma(d)) + 0.5 * abs(luma(lu + ru) - luma(ld + rd));
@@ -377,7 +387,8 @@ float3 draw_native_ui(float3 color, float2 pos) {
     float2 o = float2(25.0, 25.0);
     float white = 0.0;
     white = max(white, text_pixel(70,83,82,32,68,88,49,50,32,85,73,32, pos, o, 2.0));       // FSR DX12 UI
-    white = max(white, text_pixel(80,79,83,84,32,79,78,32,32,32,32,32, pos, o + float2(0, 24), 2.0)); // POST ON
+    if (effectOn > 0.5) white = max(white, text_pixel(80,79,83,84,32,79,78,32,32,32,32,32, pos, o + float2(0, 24), 2.0)); // POST ON
+    else white = max(white, text_pixel(80,79,83,84,32,79,70,70,32,32,32,32, pos, o + float2(0, 24), 2.0)); // POST OFF
     white = max(white, text_pixel(83,67,65,76,69,32,32,32,32,32,32,32, pos, o + float2(0, 44), 2.0)); // SCALE
     white = max(white, text_pixel(83,72,65,82,80,32,32,32,32,32,32,32, pos, o + float2(0, 66), 2.0)); // SHARP
     color = lerp(color, float3(0.92, 0.92, 0.95), white);
@@ -393,10 +404,20 @@ float3 draw_native_ui(float3 color, float2 pos) {
 
 float4 EasuRcasPS(VSOut i) : SV_Target {
     float4 base = gInput.SampleLevel(gSampler, i.uv, 0.0);
-    float3 up = easu_style(i.uv);
-    float3 sharp = rcas_style(i.uv, invSize, sharpness);
-    float amount = saturate(0.45 + sharpness * 0.55);
-    float3 color = saturate(lerp(up, sharp, amount));
+    float3 color = base.rgb;
+    if (effectOn > 0.5) {
+        float3 up = easu_style(i.uv);
+        float3 sharp = rcas_style(i.uv, invSize, sharpness);
+        float amount = saturate(0.45 + sharpness * 0.55);
+        color = saturate(lerp(up, sharp, amount));
+    }
+    if (interpOn > 0.5 && historyReady > 0.5) {
+        float3 prev = gHistory.SampleLevel(gSampler, i.uv, 0.0).rgb;
+        // First experimental interpolation mode. This does not yet insert extra
+        // Presents; it validates the frame-history path by blending the current
+        // processed frame with the previous captured frame.
+        color = saturate(lerp(prev, color, 0.55));
+    }
     color = draw_native_ui(color, i.pos.xy);
     return float4(color, base.a);
 }
@@ -514,9 +535,19 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         }
         g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
+        hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &input_desc,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                            IID_PPV_ARGS(&g_history));
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] CreateCommittedResource(history texture) failed hr=0x%08lX %ux%u fmt=%u", hr, g_width, g_height, (unsigned)g_format);
+            return false;
+        }
+        g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g_history_ready = false;
+
         D3D12_DESCRIPTOR_HEAP_DESC srv_desc{};
         srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srv_desc.NumDescriptors = 2;
+        srv_desc.NumDescriptors = 3;
         srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_srv_heap));
         if (FAILED(hr)) {
@@ -534,7 +565,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         view.Texture2D.PlaneSlice = 0;
         view.Texture2D.ResourceMinLODClamp = 0.0f;
         g_dev->CreateShaderResourceView(g_input, &view, srv_cpu(0));
-        g_dev->CreateShaderResourceView(g_lowres, &view, srv_cpu(1));
+        g_dev->CreateShaderResourceView(g_history, &view, srv_cpu(1));
+        g_dev->CreateShaderResourceView(g_lowres, &view, srv_cpu(2));
         return true;
     }
 
@@ -549,6 +581,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         safe_release(g_cmd);
         safe_release(g_input);
         safe_release(g_lowres);
+        safe_release(g_history);
         safe_release(g_srv_heap);
         safe_release(g_downscale_pso);
         safe_release(g_easu_rcas_pso);
@@ -560,6 +593,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_low_height = 0;
         g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
         g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g_history_ready = false;
     }
 
     bool create_render_targets(IDXGISwapChain* sc) {
@@ -641,10 +676,14 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         DXGI_SWAP_CHAIN_DESC desc{};
         sc->GetDesc(&desc);
         g_hwnd = desc.OutputWindow;
-        g_sharpen_enabled = !env_disabled(L"FSRINJ_DX12_SHARPEN");
+        g_effect_allowed = !env_disabled(L"FSRINJ_DX12_SHARPEN");
+        g_effect_enabled = g_effect_allowed;
+        g_menu_visible = core::config().overlay_visible.load();
         g_sharpness = env_float(L"FSRINJ_DX12_SHARPNESS", core::config().sharpness.load());
         if (g_sharpness <= 0.0f) g_sharpness = 0.20f;
+        if (g_sharpness > 1.0f) g_sharpness = 1.0f;
         g_scale = env_scale(L"FSRINJ_DX12_SCALE", 0.77f);
+        g_interpolation_enabled = !env_disabled(L"FSRINJ_DX12_INTERP") && env_float(L"FSRINJ_DX12_INTERP", 0.0f) > 0.5f;
 
         hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         if (FAILED(hr)) {
@@ -661,8 +700,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
 
         LOGF("[overlay-dx12] EASU-style test upscale + RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
-             static_cast<void*>(g_queue), g_sharpen_enabled ? "on" : "off", g_sharpness);
-        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Dear ImGui remains bypassed on DX12");
+             static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness);
+        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=interpolation");
         return true;
     }
 
@@ -679,8 +718,9 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     }
 
     void bind_fullscreen_state(D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height,
-                               ID3D12PipelineState* pso, D3D12_GPU_DESCRIPTOR_HANDLE srv,
-                               float inv_x, float inv_y, float sharpness, float scale) {
+                               ID3D12PipelineState* pso,
+                               float inv_x, float inv_y, float sharpness, float scale,
+                               bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled) {
         D3D12_VIEWPORT vp{};
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
@@ -697,9 +737,9 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_cmd->SetGraphicsRootSignature(g_root_sig);
         g_cmd->SetPipelineState(pso);
         g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g_cmd->SetGraphicsRootDescriptorTable(0, srv);
-        const float params[8] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), 1.0f, 0.0f };
-        g_cmd->SetGraphicsRoot32BitConstants(1, 8, params, 0);
+        g_cmd->SetGraphicsRootDescriptorTable(0, srv_gpu(0));
+        const float params[10] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f };
+        g_cmd->SetGraphicsRoot32BitConstants(1, 10, params, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
     }
 
@@ -714,18 +754,35 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         transition(g_cmd, g_input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         g_input_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 
-        transition(g_cmd, g_lowres, g_lowres_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso, srv_gpu(0),
-                              1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
-                              g_sharpness, g_scale);
-        transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        float final_inv_x = 1.0f / static_cast<float>(g_width);
+        float final_inv_y = 1.0f / static_cast<float>(g_height);
+
+        if (g_effect_enabled) {
+            transition(g_cmd, g_lowres, g_lowres_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso,
+                                  1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
+                                  g_sharpness, g_scale, false, true, g_history_ready, g_interpolation_enabled);
+            transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            final_inv_x = 1.0f / static_cast<float>(g_low_width);
+            final_inv_y = 1.0f / static_cast<float>(g_low_height);
+        }
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        bind_fullscreen_state(f.rtv, g_width, g_height, g_easu_rcas_pso, srv_gpu(1),
-                              1.0f / static_cast<float>(g_low_width), 1.0f / static_cast<float>(g_low_height),
-                              g_sharpness, g_scale);
+        bind_fullscreen_state(f.rtv, g_width, g_height, g_easu_rcas_pso,
+                              final_inv_x, final_inv_y,
+                              g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
+                              g_history_ready, g_interpolation_enabled);
+        transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g_input_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        transition(g_cmd, g_history, g_history_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        g_history_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_cmd->CopyResource(g_history, g_input);
+        transition(g_cmd, g_history, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g_history_ready = true;
+
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         return true;
     }
@@ -742,22 +799,69 @@ bool on_present(IDXGISwapChain* sc) {
     }
 
     ++g_present_count;
-    if (g_sharpen_enabled && g_present_count <= kWarmupPresents) {
+    if ((g_effect_enabled || g_menu_visible) && g_present_count <= kWarmupPresents) {
         LOGF("[overlay-dx12] warmup present %u/%u; skipping EASU-style test upscale", g_present_count, kWarmupPresents);
         return true;
     }
 
-    static bool prev = false;
-    bool down = (GetAsyncKeyState(core::config().toggle_key.load()) & 0x8000) != 0;
-    if (down && !prev) {
-        bool v = core::config().overlay_visible.load();
-        core::config().overlay_visible.store(!v);
-        LOGF("[overlay-dx12] Home toggle: DX12 EASU-style test upscale %s", !v ? "visible/enabled" : "hidden/disabled");
-    }
-    prev = down;
+    bool recreate_scale_resources = false;
+    auto clamp01 = [](float v) -> float { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+    auto clamp_scale = [](float v) -> float { return v < 0.50f ? 0.50f : (v > 1.00f ? 1.00f : v); };
+    auto pressed = [](int vk) -> bool { return (GetAsyncKeyState(vk) & 0x0001) != 0; };
 
-    if (!g_sharpen_enabled) return true;
-    if (!core::config().overlay_visible.load()) return true;
+    if (pressed(core::config().toggle_key.load())) {
+        g_menu_visible = !g_menu_visible;
+        core::config().overlay_visible.store(g_menu_visible);
+        LOGF("[overlay-dx12] Home: native menu %s", g_menu_visible ? "shown" : "hidden");
+    }
+    if (pressed(VK_END)) {
+        if (g_effect_allowed) {
+            g_effect_enabled = !g_effect_enabled;
+            LOGF("[overlay-dx12] End: DX12 post-process %s", g_effect_enabled ? "enabled" : "disabled");
+        } else {
+            LOGF("[overlay-dx12] End ignored: DX12 post-process disabled by FSRINJ_DX12_SHARPEN=0");
+        }
+    }
+    if (pressed(VK_PRIOR)) { // PageUp
+        g_sharpness = clamp01(g_sharpness + 0.05f);
+        core::config().sharpness.store(g_sharpness);
+        LOGF("[overlay-dx12] PageUp: sharpness=%.2f", g_sharpness);
+    }
+    if (pressed(VK_NEXT)) { // PageDown
+        g_sharpness = clamp01(g_sharpness - 0.05f);
+        core::config().sharpness.store(g_sharpness);
+        LOGF("[overlay-dx12] PageDown: sharpness=%.2f", g_sharpness);
+    }
+    if (pressed(VK_INSERT)) {
+        g_scale = clamp_scale(g_scale + 0.02f);
+        recreate_scale_resources = true;
+        LOGF("[overlay-dx12] Insert: scale=%.2f", g_scale);
+    }
+    if (pressed(VK_DELETE)) {
+        g_scale = clamp_scale(g_scale - 0.02f);
+        recreate_scale_resources = true;
+        LOGF("[overlay-dx12] Delete: scale=%.2f", g_scale);
+    }
+    if (pressed(VK_F1)) { g_scale = 0.77f; g_sharpness = 0.35f; recreate_scale_resources = true; LOGF("[overlay-dx12] F1 preset: Quality scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
+    if (pressed(VK_F2)) { g_scale = 0.67f; g_sharpness = 0.45f; recreate_scale_resources = true; LOGF("[overlay-dx12] F2 preset: Balanced scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
+    if (pressed(VK_F3)) { g_scale = 0.59f; g_sharpness = 0.55f; recreate_scale_resources = true; LOGF("[overlay-dx12] F3 preset: Performance scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
+    if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: experimental interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
+
+    if (recreate_scale_resources && g_init) {
+        wait_for_gpu_idle();
+        release_frame_resources();
+        if (!create_render_targets(sc)) {
+            LOGF("[overlay-dx12] failed to recreate resources after scale change; disabling effect for safety");
+            g_effect_enabled = false;
+            return true;
+        }
+        g_present_count = 0;
+        g_logged_first_effect = false;
+        LOGF("[overlay-dx12] recreated resources for scale=%.2f lowres=%ux%u", g_scale, g_low_width, g_low_height);
+        return true;
+    }
+
+    if (!g_effect_enabled && !g_menu_visible) return true;
 
     const UINT idx = g_sc3 ? g_sc3->GetCurrentBackBufferIndex() : 0;
     if (idx >= g_frames.size()) {
@@ -822,8 +926,12 @@ void shutdown() {
     safe_release(g_dev);
     safe_release(g_sc3);
     g_next_fence_value = 1;
-    g_sharpen_enabled = true;
+    g_effect_allowed = true;
+    g_effect_enabled = true;
+    g_menu_visible = true;
     g_logged_first_effect = false;
+    g_history_ready = false;
+    g_interpolation_enabled = false;
     g_sharpness = 0.20f;
     g_scale = 0.77f;
     g_present_count = 0;

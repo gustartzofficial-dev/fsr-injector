@@ -128,3 +128,19 @@ The DX12 path now has a fullscreen RCAS-style sharpening pass. This is not full 
 Suggested commit name: `Add native DX12 settings overlay`
 
 This build keeps Dear ImGui bypassed for DX12 and draws a lightweight native D3D12 overlay directly inside the working EASU/RCAS fullscreen pass. The overlay shows the DX12 UI header, post-process status, scale, sharpness, and a small scale bar. This follows the safer path used by mature DX12 overlays: separate capture/render backend from UI state, keep per-frame synchronization, and avoid the ImGui DX12 backend until descriptor/input issues are isolated.
+
+### DX12 native menu controls
+
+The DX12 backend uses a lightweight native overlay instead of Dear ImGui.
+
+- Home: show/hide the native menu.
+- End: enable/disable the DX12 EASU/RCAS post-process effect.
+- PageUp/PageDown: adjust sharpness.
+- Insert/Delete: adjust internal test scale.
+- F1/F2/F3: Quality/Balanced/Performance presets.
+
+The menu should remain visible while the post-process effect is on or off. The post-process effect and menu visibility are separate states.
+
+### DX12 experimental interpolation
+
+The DX12 backend now includes a frame-history texture and a first interpolation experiment. Press `F4` to toggle the previous/current frame blend. This is a validation step before real generated-frame scheduling; it does not yet inject additional presented frames.
