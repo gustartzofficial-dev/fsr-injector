@@ -38,6 +38,7 @@ namespace {
     ID3D12Resource* g_lowres = nullptr;
     ID3D12Resource* g_history = nullptr;
     ID3D12Resource* g_generated = nullptr;
+    ID3D12Resource* g_scout_motion = nullptr;
     HANDLE g_fence_event = nullptr;
     UINT64 g_next_fence_value = 1;
     std::vector<FrameContext> g_frames;
@@ -57,6 +58,8 @@ namespace {
     bool g_interpolation_enabled = false;
     bool g_generated_present_enabled = false;
     bool g_generated_ready = false;
+    bool g_scout_motion_enabled = false;
+    bool g_scout_motion_bound = false;
     bool g_prev_left_mouse = false;
     bool g_inside_generated_present = false;
     LARGE_INTEGER g_qpc_freq{};
@@ -76,6 +79,9 @@ namespace {
     D3D12_RESOURCE_STATES g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     D3D12_RESOURCE_STATES g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     D3D12_RESOURCE_STATES g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    DXGI_FORMAT g_scout_motion_format = DXGI_FORMAT_UNKNOWN;
+    unsigned g_scout_motion_width = 0;
+    unsigned g_scout_motion_height = 0;
 
     template <class T>
     void safe_release(T*& p) {
@@ -206,7 +212,7 @@ namespace {
     bool create_upscale_pipeline() {
         D3D12_DESCRIPTOR_RANGE range{};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 3;
+        range.NumDescriptors = 4;
         range.BaseShaderRegister = 0;
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -269,6 +275,7 @@ namespace {
 Texture2D<float4> gInput : register(t0);
 Texture2D<float4> gHistory : register(t1);
 Texture2D<float4> gLowres : register(t2);
+Texture2D<float4> gScoutMotion : register(t3);
 SamplerState gSampler : register(s0);
 cbuffer Params : register(b0) {
     float2 invSize;
@@ -455,6 +462,8 @@ float3 draw_native_ui(float3 color, float2 pos) {
     else white = max(white, text_pixel(70,52,32,77,79,84,78,32,79,70,70,32, pos, o + float2(0, 90), 2.0)); // F4 MOTN OFF
     if (genPresentOn > 0.5) white = max(white, text_pixel(70,53,32,71,69,78,32,79,78,32,32,32, pos, o + float2(0, 114), 2.0)); // F5 GEN ON
     else white = max(white, text_pixel(70,53,32,71,69,78,32,79,70,70,32,32, pos, o + float2(0, 114), 2.0)); // F5 GEN OFF
+    if (scoutOn > 0.5 && scoutMotion > 0.5) white = max(white, text_pixel(70,54,32,77,86,32,32,79,78,32,32,32, pos, o + float2(0, 138), 2.0)); // F6 MV ON
+    else white = max(white, text_pixel(70,54,32,77,86,32,32,79,70,70,32,32, pos, o + float2(0, 138), 2.0)); // F6 MV OFF
     if (historyReady > 0.5) white = max(white, text_pixel(72,73,83,84,32,82,69,65,68,89,32,32, pos, o + float2(0, 138), 2.0)); // HIST READY
     else white = max(white, text_pixel(72,73,83,84,32,87,65,82,77,32,32,32, pos, o + float2(0, 138), 2.0)); // HIST WARM
     white = max(white, text_pixel(70,80,83,32,71,65,77,69,32,32,32,32, pos, o + float2(0, 162), 2.0)); // FPS GAME
@@ -514,9 +523,28 @@ float2 estimate_optical_flow_lite(float2 uv, out float confidence) {
     return bestOff;
 }
 
+float2 scout_motion_vector(float2 uv, out float mvConfidence) {
+    float4 mv = gScoutMotion.SampleLevel(gSampler, uv, 0.0);
+    // Candidate buffers are generic. Treat RG as either signed velocity or encoded
+    // 0..1 velocity, then clamp hard so false positives do not explode.
+    float2 raw = mv.rg;
+    float2 signedA = raw;
+    float2 signedB = raw * 2.0 - 1.0;
+    float2 pick = dot(abs(signedA), float2(1.0, 1.0)) < dot(abs(signedB), float2(1.0, 1.0)) ? signedA : signedB;
+    float mag = length(pick);
+    mvConfidence = saturate((mag - 0.0003) * 400.0) * (1.0 - saturate(mag * 8.0));
+    return clamp(pick * 0.035, float2(-0.08, -0.08), float2(0.08, 0.08));
+}
+
 float3 fsr3_lite_interpolate(float2 uv, float3 processedCurr) {
     float conf = 0.0;
     float2 flow = estimate_optical_flow_lite(uv, conf);
+    if (scoutOn > 0.5 && scoutMotion > 0.5) {
+        float mvConf = 0.0;
+        float2 mvFlow = scout_motion_vector(uv, mvConf);
+        flow = lerp(flow, mvFlow, mvConf);
+        conf = max(conf, mvConf * 0.85);
+    }
     float3 prevWarp = gHistory.SampleLevel(gSampler, uv - flow * 0.50, 0.0).rgb;
     float3 currWarp = gInput.SampleLevel(gSampler, uv + flow * 0.50, 0.0).rgb;
     float3 motionFrame = lerp(prevWarp, currWarp, 0.50);
@@ -692,7 +720,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
 
         D3D12_DESCRIPTOR_HEAP_DESC srv_desc{};
         srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srv_desc.NumDescriptors = 3;
+        srv_desc.NumDescriptors = 4;
         srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_srv_heap));
         if (FAILED(hr)) {
@@ -712,6 +740,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_dev->CreateShaderResourceView(g_input, &view, srv_cpu(0));
         g_dev->CreateShaderResourceView(g_history, &view, srv_cpu(1));
         g_dev->CreateShaderResourceView(g_lowres, &view, srv_cpu(2));
+        g_dev->CreateShaderResourceView(nullptr, &view, srv_cpu(3));
         return true;
     }
 
@@ -728,6 +757,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         safe_release(g_lowres);
         safe_release(g_history);
         safe_release(g_generated);
+        safe_release(g_scout_motion);
         safe_release(g_srv_heap);
         safe_release(g_downscale_pso);
         safe_release(g_easu_rcas_pso);
@@ -836,6 +866,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_scale = env_scale(L"FSRINJ_DX12_SCALE", 0.77f);
         g_interpolation_enabled = !env_disabled(L"FSRINJ_DX12_INTERP") && env_float(L"FSRINJ_DX12_INTERP", 0.0f) > 0.5f;
         g_generated_present_enabled = !env_disabled(L"FSRINJ_DX12_GENPRESENT") && env_float(L"FSRINJ_DX12_GENPRESENT", 0.0f) > 0.5f;
+        g_scout_motion_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV") && env_float(L"FSRINJ_DX12_SCOUT_MV", 0.0f) > 0.5f;
 
         hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         if (FAILED(hr)) {
@@ -857,7 +888,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         LOGF("[overlay-dx12] FSR1-style EASU/RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off");
-        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present; mouse clicks supported");
+        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present F6=scout-MV; mouse clicks supported");
         return true;
     }
 
@@ -877,7 +908,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                ID3D12PipelineState* pso,
                                float inv_x, float inv_y, float sharpness, float scale,
                                bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled, bool gen_present_enabled,
-                               float real_fps, float output_fps, float /*scout_on_arg*/, float /*scout_depth_arg*/, float /*scout_motion_arg*/) {
+                               float real_fps, float output_fps, float scout_on_arg, float /*scout_depth_arg*/, float scout_motion_arg) {
         D3D12_VIEWPORT vp{};
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
@@ -898,14 +929,47 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         auto scout = capture::scout::snapshot();
         const bool scout_depth_ready = scout.dx11_depth_found || scout.dx12_depth_candidates > 0;
         const bool scout_motion_ready = scout.dx12_motion_candidates > 0 || scout.final_frame_motion;
-        const float params[16] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f, real_fps, output_fps, scout.enabled ? 1.0f : 0.0f, scout_depth_ready ? 1.0f : 0.0f, scout_motion_ready ? 1.0f : 0.0f };
+        const float scout_use = scout_on_arg > 0.5f ? 1.0f : 0.0f;
+        const float scout_mv_ready = scout_motion_arg > 0.5f ? 1.0f : (scout_motion_ready ? 1.0f : 0.0f);
+        const float params[16] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f, real_fps, output_fps, scout_use, scout_depth_ready ? 1.0f : 0.0f, scout_mv_ready };
         g_cmd->SetGraphicsRoot32BitConstants(1, 16, params, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
+    }
+
+
+    void update_scout_motion_binding() {
+        g_scout_motion_bound = false;
+        if (!g_scout_motion_enabled || !g_dev || !g_srv_heap) return;
+        ID3D12Resource* candidate = nullptr;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        unsigned w = 0, h = 0;
+        if (!capture::scout::acquire_dx12_best_motion_candidate(&candidate, &fmt, &w, &h) || !candidate) return;
+        if (candidate != g_scout_motion) {
+            safe_release(g_scout_motion);
+            g_scout_motion = candidate;
+            g_scout_motion_format = fmt;
+            g_scout_motion_width = w;
+            g_scout_motion_height = h;
+            D3D12_SHADER_RESOURCE_VIEW_DESC mv_view{};
+            mv_view.Format = fmt;
+            mv_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            mv_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            mv_view.Texture2D.MipLevels = 1;
+            mv_view.Texture2D.MostDetailedMip = 0;
+            mv_view.Texture2D.PlaneSlice = 0;
+            mv_view.Texture2D.ResourceMinLODClamp = 0.0f;
+            g_dev->CreateShaderResourceView(g_scout_motion, &mv_view, srv_cpu(3));
+            LOGF("[overlay-dx12] scout MV candidate bound %ux%u fmt=%u", w, h, (unsigned)fmt);
+        } else {
+            candidate->Release();
+        }
+        g_scout_motion_bound = true;
     }
 
     bool render_upscale(FrameContext& f) {
         if (!g_input || !g_lowres || !g_srv_heap || !g_downscale_pso || !g_easu_rcas_pso || !g_root_sig) return false;
         if (g_width == 0 || g_height == 0 || g_low_width == 0 || g_low_height == 0) return false;
+        update_scout_motion_binding();
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -923,7 +987,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso,
                                   1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
                                   g_sharpness, g_scale, false, true, g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps, 1.0f, 0.0f, 1.0f);
+                                  g_real_fps, g_output_fps, (g_scout_motion_enabled && g_scout_motion_bound) ? 1.0f : 0.0f, 0.0f, g_scout_motion_bound ? 1.0f : 0.0f);
             transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             final_inv_x = 1.0f / static_cast<float>(g_low_width);
@@ -937,7 +1001,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                   final_inv_x, final_inv_y,
                                   g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
                                   g_history_ready, true, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps, 1.0f, 0.0f, 1.0f);
+                                  g_real_fps, g_output_fps, (g_scout_motion_enabled && g_scout_motion_bound) ? 1.0f : 0.0f, 0.0f, g_scout_motion_bound ? 1.0f : 0.0f);
             transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_generated_ready = true;
@@ -950,7 +1014,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                               final_inv_x, final_inv_y,
                               g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
                               g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                              g_real_fps, g_output_fps, 1.0f, 0.0f, 1.0f);
+                              g_real_fps, g_output_fps, (g_scout_motion_enabled && g_scout_motion_bound) ? 1.0f : 0.0f, 0.0f, g_scout_motion_bound ? 1.0f : 0.0f);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g_input_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         transition(g_cmd, g_history, g_history_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1012,6 +1076,10 @@ void handle_mouse_controls() {
         g_generated_ready = false;
         g_generated_present_log_count = 0;
         LOGF("[overlay-dx12] mouse: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
+    } else if (inside(20, 160, 245, 180)) {
+        g_scout_motion_enabled = !g_scout_motion_enabled;
+        g_generated_ready = false;
+        LOGF("[overlay-dx12] mouse: scout motion-vector candidate %s (bound=%s)", g_scout_motion_enabled ? "enabled" : "disabled", g_scout_motion_bound ? "yes" : "no");
     }
 
     if (recreate_scale_resources && g_init) {
@@ -1037,7 +1105,6 @@ bool on_present(IDXGISwapChain* sc) {
     }
 
     update_fps_counters(0);
-    capture::scout::log_dx12_frame_summary_tick();
 
     ++g_present_count;
     if ((g_effect_enabled || g_menu_visible || g_generated_present_enabled) && g_present_count <= kWarmupPresents) {
@@ -1088,6 +1155,7 @@ bool on_present(IDXGISwapChain* sc) {
     if (pressed(VK_F3)) { g_scale = 0.59f; g_sharpness = 0.55f; recreate_scale_resources = true; LOGF("[overlay-dx12] F3 preset: Performance scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
     if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
     if (pressed(VK_F5)) { g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0; LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
+    if (pressed(VK_F6)) { g_scout_motion_enabled = !g_scout_motion_enabled; g_generated_ready = false; LOGF("[overlay-dx12] F6: scout motion-vector candidate %s (bound=%s)", g_scout_motion_enabled ? "enabled" : "disabled", g_scout_motion_bound ? "yes" : "no"); }
 
     handle_mouse_controls();
 

@@ -210,54 +210,20 @@ Expected log lines after some gameplay:
 
 If `depthCand` stays at zero, the next scout step is descriptor-heap scanning or device-resource creation hooks. If `mvCand` stays zero, the game may not render velocity buffers at all, which is common for older/non-upscaler games.
 
-## Scout v2 command-list tracking
+## Scout MV test path
 
-Suggested commit name: `Add DX12 command-list scout tracking`
+Added an experimental F6 toggle for using the generic DX12 scout's best motion-vector-like render target candidate. This is deliberately opt-in because generic candidates can be false positives. F4/F5 still work with final-frame optical-flow-lite when F6 is off.
 
-This version fixes the command-list scout vtable slots and adds early command-list hooking through `ID3D12Device::CreateCommandList`. It now attempts to track actual command recording calls instead of only device/queue creation:
+Controls added:
 
-- `ID3D12Device::CreateCommandList`
-- `ID3D12GraphicsCommandList::DrawInstanced`
-- `ID3D12GraphicsCommandList::DrawIndexedInstanced`
-- `ID3D12GraphicsCommandList::SetPipelineState`
-- `ID3D12GraphicsCommandList::ResourceBarrier`
-- `ID3D12GraphicsCommandList::SetGraphicsRootDescriptorTable`
-- `ID3D12GraphicsCommandList::OMSetRenderTargets`
+- F6: toggle scout MV candidate usage.
+- `FSRINJ_DX12_SCOUT_MV=1`: enable scout MV usage at startup.
 
-Expected log markers:
+Expected logs:
 
 ```text
-[dx12] hooked ID3D12Device::CreateCommandList
-[dx12] hooked ID3D12GraphicsCommandList::DrawInstanced
-[dx12] hooked ID3D12GraphicsCommandList::DrawIndexedInstanced
-[dx12] hooked ID3D12GraphicsCommandList::ResourceBarrier
-[dx12] hooked ID3D12GraphicsCommandList::OMSetRenderTargets
-[scout-dx12] cmdlists=... exec=... draws=... barriers=... pso=... rootTbl=... rtv=... dsv=... omrt=... omdsv=... depthCand=... mvCand=...
+[overlay-dx12] F6: scout motion-vector candidate enabled
+[overlay-dx12] scout MV candidate bound 1920x1080 fmt=10
 ```
 
-This still does not feed discovered candidates into frame generation. It is the data-gathering step needed before depth-assisted rejection or velocity-buffer experiments.
-
-## Scout v2.1 DX12/DX11 parity diagnostics
-
-This patch adds two practical diagnostics upgrades:
-
-- DX12 scout summaries are flushed from the Present path every 120 real Presents, even when command-list hooks do not emit enough ExecuteCommandLists activity to hit the older periodic logger.
-- DX11 depth/scout hooks now cover more of the same high-value render flow we learned from the DX12 work: OMSetRenderTargetsAndUnorderedAccessViews, Draw, DrawIndexed, and PSSetShaderResources. This gives DX11 logs enough context to tell whether the game is actively using the generic scout path.
-
-Expected DX12 lines:
-
-```text
-[scout-dx12] presentSummary cmdlists=... exec=... draws=... barriers=... rtv=... dsv=... omrt=... omdsv=... depthCand=... mvCand=...
-```
-
-Expected DX11 lines when testing a DX11 game:
-
-```text
-[depth] OMSetRenderTargetsAndUAV hooked
-[depth] Draw hooked
-[depth] DrawIndexed hooked
-[depth] PSSetShaderResources hooked
-[scout-dx11] om=... omuav=... draw=... pssrv=... depth=...
-```
-
-This is still a detection/diagnostic patch. It does not yet feed discovered DX12/DX11 depth or motion candidates into the frame-generation shader.
+This is not a final UI design. The current hotkeys are temporary test controls and should later be replaced by a single proper clickable menu similar to upscaler replacement tools.

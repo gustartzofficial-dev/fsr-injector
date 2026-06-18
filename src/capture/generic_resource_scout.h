@@ -42,6 +42,7 @@ struct Snapshot {
     unsigned dx12_best_motion_width = 0;
     unsigned dx12_best_motion_height = 0;
     DXGI_FORMAT dx12_best_motion_format = DXGI_FORMAT_UNKNOWN;
+    bool dx12_best_motion_resource_available = false;
 };
 
 void set_enabled(bool enabled);
@@ -59,9 +60,12 @@ void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource
 void note_dx12_dsv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc);
 void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_handles, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_handle);
 
+// Returns AddRef'd resource for the current best motion/velocity-like candidate.
+// Caller must Release(). This is experimental and may be a false positive.
+bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height);
+
 Snapshot snapshot();
 void log_snapshot_once();
 void log_dx12_candidates_periodic();
-void log_dx12_frame_summary_tick();
 
 } // namespace capture::scout

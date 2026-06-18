@@ -19,13 +19,13 @@ namespace {
         bool depth_candidate = false;
         bool motion_candidate = false;
         unsigned bind_count = 0;
+        ID3D12Resource* resource = nullptr; // raw pointer; AddRef only during acquire.
     };
 
     std::mutex g_mtx;
     Snapshot g_state{};
     bool g_logged = false;
     unsigned g_periodic_log_count = 0;
-    unsigned g_present_log_count = 0;
     std::unordered_map<SIZE_T, DescriptorInfo> g_descriptors;
 
     bool is_depth_format(DXGI_FORMAT f) {
@@ -101,6 +101,7 @@ namespace {
                 g_state.dx12_best_motion_width = info.width;
                 g_state.dx12_best_motion_height = info.height;
                 g_state.dx12_best_motion_format = info.view_format != DXGI_FORMAT_UNKNOWN ? info.view_format : info.resource_format;
+                g_state.dx12_best_motion_resource_available = info.resource != nullptr;
             }
         }
     }
@@ -135,6 +136,7 @@ void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource
     info.height = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? static_cast<unsigned>(rd.DepthOrArraySize) : rd.Height;
     info.resource_format = rd.Format;
     info.view_format = desc ? desc->Format : rd.Format;
+    info.resource = resource;
     info.motion_candidate = near_swap_size(info.width, info.height) && is_motion_like_format(info.view_format != DXGI_FORMAT_UNKNOWN ? info.view_format : info.resource_format);
 
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -154,6 +156,7 @@ void note_dx12_dsv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource
     info.height = rd.Height;
     info.resource_format = rd.Format;
     info.view_format = desc ? desc->Format : rd.Format;
+    info.resource = resource;
     info.depth_candidate = near_swap_size(info.width, info.height) && (is_depth_format(info.view_format) || is_depth_format(info.resource_format));
 
     std::lock_guard<std::mutex> lk(g_mtx);
@@ -177,6 +180,33 @@ void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_ha
             if (it != g_descriptors.end()) { ++it->second.bind_count; if (it->second.motion_candidate) update_best_locked(it->second); }
         }
     }
+}
+
+bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height) {
+    if (out_resource) *out_resource = nullptr;
+    if (out_format) *out_format = DXGI_FORMAT_UNKNOWN;
+    if (out_width) *out_width = 0;
+    if (out_height) *out_height = 0;
+    std::lock_guard<std::mutex> lk(g_mtx);
+    ID3D12Resource* best = nullptr;
+    DescriptorInfo best_info{};
+    for (const auto& kv : g_descriptors) {
+        const DescriptorInfo& info = kv.second;
+        if (!info.motion_candidate || !info.resource) continue;
+        if (!best || (info.bind_count > best_info.bind_count) ||
+            (info.bind_count == best_info.bind_count && info.width * info.height >= best_info.width * best_info.height)) {
+            best = info.resource;
+            best_info = info;
+        }
+    }
+    if (!best) return false;
+    best->AddRef();
+    if (out_resource) *out_resource = best;
+    else best->Release();
+    if (out_format) *out_format = best_info.view_format != DXGI_FORMAT_UNKNOWN ? best_info.view_format : best_info.resource_format;
+    if (out_width) *out_width = best_info.width;
+    if (out_height) *out_height = best_info.height;
+    return true;
 }
 
 Snapshot snapshot() {
@@ -207,17 +237,6 @@ void log_dx12_candidates_periodic() {
     Snapshot s = snapshot();
     if ((++g_periodic_log_count % 600) != 0) return;
     LOGF("[scout-dx12] cmdlists=%u exec=%u draws=%u barriers=%u pso=%u rootTbl=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
-         s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers, s.dx12_pso_sets, s.dx12_root_table_sets,
-         s.dx12_rtv_descriptors, s.dx12_dsv_descriptors, s.dx12_om_rt_binds, s.dx12_om_depth_binds,
-         s.dx12_depth_candidates, s.dx12_best_depth_width, s.dx12_best_depth_height, fmt_name(s.dx12_best_depth_format),
-         s.dx12_motion_candidates, s.dx12_best_motion_width, s.dx12_best_motion_height, fmt_name(s.dx12_best_motion_format));
-}
-
-void log_dx12_frame_summary_tick() {
-    Snapshot s = snapshot();
-    if (s.api != ApiKind::DX12) return;
-    if ((++g_present_log_count % 120) != 0) return;
-    LOGF("[scout-dx12] presentSummary cmdlists=%u exec=%u draws=%u barriers=%u pso=%u rootTbl=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
          s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers, s.dx12_pso_sets, s.dx12_root_table_sets,
          s.dx12_rtv_descriptors, s.dx12_dsv_descriptors, s.dx12_om_rt_binds, s.dx12_om_depth_binds,
          s.dx12_depth_candidates, s.dx12_best_depth_width, s.dx12_best_depth_height, fmt_name(s.dx12_best_depth_format),
