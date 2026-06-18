@@ -82,25 +82,33 @@ The DX12 overlay now skips the first Present that performs initialization and wa
 
 If a game still closes instantly, the last emitted `[overlay-dx12] step:` line identifies the failing stage.
 
-## DX12 native marker diagnostic patch
+## Patch: DX12 backbuffer sharpening pass
 
-This version intentionally bypasses Dear ImGui on the DX12 backend. The previous DX12 overlay path crashed at `ImGui_ImplDX12_NewFrame()` / ImGui frame startup after command allocator reset, command list reset, resource barrier, RTV binding, and descriptor heap binding had already succeeded. To isolate raw D3D12 rendering from ImGui backend issues, the DX12 backend now renders a small native marker using `ClearRenderTargetView` on a 80x80 rect in the top-left corner.
+This patch replaces the native magenta DX12 marker with the first real DX12 image-processing feature.
 
-Expected DX12 behavior:
+Status:
+
+- DX12 ImGui is still bypassed because the ImGui backend crashed at `ImGui new frame`.
+- The DX12 command queue capture, command allocator, command list, barrier, RTV, and fence path remains active.
+- A temporary copy of the current swapchain backbuffer is created every frame.
+- A fullscreen triangle pixel shader samples that temporary texture and writes a simple sharpening pass back into the swapchain backbuffer.
+- The Home key toggles the DX12 sharpen pass on/off through the existing overlay-visible config flag.
+
+Environment variables:
+
+- `FSRINJ_DX12_SHARPEN=0` disables the DX12 sharpen pass.
+- `FSRINJ_DX12_SHARPNESS=<0.0-1.0>` overrides the initial DX12 sharpness value.
+
+Expected log lines:
 
 ```text
-[overlay-dx12] native marker initialized ... marker=on
-[overlay-dx12] ImGui is intentionally bypassed on DX12; this patch tests raw D3D12 backbuffer writes only
-[overlay-dx12] init-only present skipped; marker render begins after warmup
-[overlay-dx12] warmup present 1/3; skipping marker
-[overlay-dx12] step: native marker ClearRenderTargetView
-[overlay-dx12] marker render end
+[overlay-dx12] sharpen pass initialized ... enabled=on sharpness=...
+[overlay-dx12] init-only present skipped; sharpen begins after warmup
+[overlay-dx12] warmup present 1/3; skipping sharpen
+[overlay-dx12] first DX12 sharpen frame submitted successfully
 ```
 
-A magenta square in the top-left means our injected D3D12 command list can safely write to the swapchain backbuffer. That is the required milestone before implementing DX12 sharpening/upscaling. Set `FSRINJ_DX12_MARKER=0` to disable the marker without rebuilding.
+Next milestone if this works:
 
-Suggested commit name:
-
-```text
-Replace DX12 ImGui bring-up with native render marker
-```
+- Replace this simple sharpening shader with a FidelityFX-style RCAS pass.
+- Then add an EASU/FSR1-style spatial upscaler path using the same backbuffer copy and fullscreen render infrastructure.
