@@ -176,7 +176,7 @@ namespace {
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[1].Constants.ShaderRegister = 0;
         params[1].Constants.RegisterSpace = 0;
-        params[1].Constants.Num32BitValues = 4;
+        params[1].Constants.Num32BitValues = 8;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -229,6 +229,9 @@ cbuffer Params : register(b0) {
     float2 invSize;
     float sharpness;
     float scale;
+    float2 invOutputSize;
+    float overlayOn;
+    float _pad0;
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -310,12 +313,92 @@ float3 easu_style(float2 uv) {
     return lerp(0.55 * c + 0.35 * axis + 0.10 * diag, 0.72 * c + 0.28 * axis, edge);
 }
 
+uint glyph_row(uint ch, uint row) {
+    // 5x7 uppercase/digit bitmap rows, MSB on the left. This keeps the DX12 UI
+    // independent from Dear ImGui while still giving us readable diagnostics.
+    if (ch == 32) return 0u;
+    if (ch == 46) return row == 6u ? 4u : 0u;
+    if (ch == 48) { uint r[7] = {14u,17u,19u,21u,25u,17u,14u}; return r[row]; }
+    if (ch == 49) { uint r[7] = {4u,12u,4u,4u,4u,4u,14u}; return r[row]; }
+    if (ch == 50) { uint r[7] = {14u,17u,1u,2u,4u,8u,31u}; return r[row]; }
+    if (ch == 51) { uint r[7] = {30u,1u,1u,14u,1u,1u,30u}; return r[row]; }
+    if (ch == 52) { uint r[7] = {2u,6u,10u,18u,31u,2u,2u}; return r[row]; }
+    if (ch == 53) { uint r[7] = {31u,16u,16u,30u,1u,1u,30u}; return r[row]; }
+    if (ch == 54) { uint r[7] = {14u,16u,16u,30u,17u,17u,14u}; return r[row]; }
+    if (ch == 55) { uint r[7] = {31u,1u,2u,4u,8u,8u,8u}; return r[row]; }
+    if (ch == 56) { uint r[7] = {14u,17u,17u,14u,17u,17u,14u}; return r[row]; }
+    if (ch == 57) { uint r[7] = {14u,17u,17u,15u,1u,1u,14u}; return r[row]; }
+    if (ch == 65) { uint r[7] = {14u,17u,17u,31u,17u,17u,17u}; return r[row]; }
+    if (ch == 67) { uint r[7] = {14u,17u,16u,16u,16u,17u,14u}; return r[row]; }
+    if (ch == 68) { uint r[7] = {30u,17u,17u,17u,17u,17u,30u}; return r[row]; }
+    if (ch == 69) { uint r[7] = {31u,16u,16u,30u,16u,16u,31u}; return r[row]; }
+    if (ch == 70) { uint r[7] = {31u,16u,16u,30u,16u,16u,16u}; return r[row]; }
+    if (ch == 72) { uint r[7] = {17u,17u,17u,31u,17u,17u,17u}; return r[row]; }
+    if (ch == 73) { uint r[7] = {14u,4u,4u,4u,4u,4u,14u}; return r[row]; }
+    if (ch == 74) { uint r[7] = {7u,2u,2u,2u,18u,18u,12u}; return r[row]; }
+    if (ch == 76) { uint r[7] = {16u,16u,16u,16u,16u,16u,31u}; return r[row]; }
+    if (ch == 78) { uint r[7] = {17u,25u,21u,19u,17u,17u,17u}; return r[row]; }
+    if (ch == 79) { uint r[7] = {14u,17u,17u,17u,17u,17u,14u}; return r[row]; }
+    if (ch == 80) { uint r[7] = {30u,17u,17u,30u,16u,16u,16u}; return r[row]; }
+    if (ch == 82) { uint r[7] = {30u,17u,17u,30u,20u,18u,17u}; return r[row]; }
+    if (ch == 83) { uint r[7] = {15u,16u,16u,14u,1u,1u,30u}; return r[row]; }
+    if (ch == 84) { uint r[7] = {31u,4u,4u,4u,4u,4u,4u}; return r[row]; }
+    if (ch == 88) { uint r[7] = {17u,10u,4u,4u,4u,10u,17u}; return r[row]; }
+    return 0u;
+}
+
+float glyph_pixel(uint ch, float2 pos, float2 origin, float scale_px) {
+    float2 q = (pos - origin) / scale_px;
+    if (q.x < 0.0 || q.y < 0.0 || q.x >= 5.0 || q.y >= 7.0) return 0.0;
+    uint col = (uint)floor(q.x);
+    uint row = (uint)floor(q.y);
+    uint bits = glyph_row(ch, row);
+    return ((bits >> (4u - col)) & 1u) ? 1.0 : 0.0;
+}
+
+float text_pixel(uint ch0,uint ch1,uint ch2,uint ch3,uint ch4,uint ch5,uint ch6,uint ch7,uint ch8,uint ch9,uint ch10,uint ch11, float2 pos, float2 origin, float scale_px) {
+    uint chars[12] = {ch0,ch1,ch2,ch3,ch4,ch5,ch6,ch7,ch8,ch9,ch10,ch11};
+    float hit = 0.0;
+    [unroll] for (uint n = 0u; n < 12u; ++n) {
+        hit = max(hit, glyph_pixel(chars[n], pos, origin + float2((float)n * 6.0 * scale_px, 0.0), scale_px));
+    }
+    return hit;
+}
+
+float3 draw_native_ui(float3 color, float2 pos) {
+    if (overlayOn < 0.5) return color;
+    float2 panelMin = float2(14.0, 14.0);
+    float2 panelMax = float2(238.0, 108.0);
+    float inside = step(panelMin.x, pos.x) * step(panelMin.y, pos.y) * step(pos.x, panelMax.x) * step(pos.y, panelMax.y);
+    color = lerp(color, float3(0.025, 0.025, 0.032), inside * 0.72);
+    float border = inside * (1.0 - step(panelMin.x + 2.0, pos.x) * step(panelMin.y + 2.0, pos.y) * step(pos.x, panelMax.x - 2.0) * step(pos.y, panelMax.y - 2.0));
+    color = lerp(color, float3(0.95, 0.18, 0.95), border);
+
+    float2 o = float2(25.0, 25.0);
+    float white = 0.0;
+    white = max(white, text_pixel(70,83,82,32,68,88,49,50,32,85,73,32, pos, o, 2.0));       // FSR DX12 UI
+    white = max(white, text_pixel(80,79,83,84,32,79,78,32,32,32,32,32, pos, o + float2(0, 24), 2.0)); // POST ON
+    white = max(white, text_pixel(83,67,65,76,69,32,32,32,32,32,32,32, pos, o + float2(0, 44), 2.0)); // SCALE
+    white = max(white, text_pixel(83,72,65,82,80,32,32,32,32,32,32,32, pos, o + float2(0, 66), 2.0)); // SHARP
+    color = lerp(color, float3(0.92, 0.92, 0.95), white);
+
+    float scaleBg = step(98.0, pos.x) * step(72.0, pos.y) * step(pos.x, 226.0) * step(pos.y, 78.0);
+    float scaleFill = step(98.0, pos.x) * step(72.0, pos.y) * step(pos.x, 98.0 + 128.0 * saturate((scale - 0.50) / 0.50)) * step(pos.y, 78.0);
+    float sharpBg = step(98.0, pos.x) * step(94.0, pos.y) * step(pos.x, 226.0) * step(pos.y, 100.0);
+    float sharpFill = step(98.0, pos.x) * step(94.0, pos.y) * step(pos.x, 98.0 + 128.0 * saturate(sharpness)) * step(pos.y, 100.0);
+    color = lerp(color, float3(0.10, 0.10, 0.12), (scaleBg + sharpBg) * 0.80);
+    color = lerp(color, float3(0.95, 0.18, 0.95), (scaleFill + sharpFill) * 0.80);
+    return color;
+}
+
 float4 EasuRcasPS(VSOut i) : SV_Target {
     float4 base = gInput.SampleLevel(gSampler, i.uv, 0.0);
     float3 up = easu_style(i.uv);
     float3 sharp = rcas_style(i.uv, invSize, sharpness);
     float amount = saturate(0.45 + sharpness * 0.55);
-    return float4(saturate(lerp(up, sharp, amount)), base.a);
+    float3 color = saturate(lerp(up, sharp, amount));
+    color = draw_native_ui(color, i.pos.xy);
+    return float4(color, base.a);
 }
 )HLSL";
 
@@ -576,10 +659,10 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
 
         if (!create_render_targets(sc)) return false;
 
-        LOGF("[overlay-dx12] EASU-style test upscale + RCAS pass initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f",
+        LOGF("[overlay-dx12] EASU-style test upscale + RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_sharpen_enabled ? "on" : "off", g_sharpness);
-        LOGF("[overlay-dx12] Dear ImGui is still bypassed on DX12; Home toggles the DX12 EASU-style test upscale path");
+        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Dear ImGui remains bypassed on DX12");
         return true;
     }
 
@@ -615,8 +698,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_cmd->SetPipelineState(pso);
         g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_cmd->SetGraphicsRootDescriptorTable(0, srv);
-        const float params[4] = { inv_x, inv_y, sharpness, scale };
-        g_cmd->SetGraphicsRoot32BitConstants(1, 4, params, 0);
+        const float params[8] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), 1.0f, 0.0f };
+        g_cmd->SetGraphicsRoot32BitConstants(1, 8, params, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
     }
 
@@ -712,7 +795,7 @@ bool on_present(IDXGISwapChain* sc) {
     g_queue->ExecuteCommandLists(1, lists);
     signal_frame(f);
     if (!g_logged_first_effect) {
-        LOGF("[overlay-dx12] first DX12 EASU-style test upscale + RCAS frame submitted successfully");
+        LOGF("[overlay-dx12] first DX12 EASU-style test upscale + RCAS + native UI frame submitted successfully");
         g_logged_first_effect = true;
     }
     return true;

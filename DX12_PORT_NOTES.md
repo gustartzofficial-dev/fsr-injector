@@ -126,36 +126,9 @@ Runtime toggles:
 - `FSRINJ_DX12_SHARPEN=0`: disables the DX12 sharpen pass.
 - `FSRINJ_DX12_SHARPNESS=0.0..1.0`: controls RCAS-style sharpness.
 
-## Patch: DX12 EASU-style test upscale path
 
-Suggested commit name: `Add DX12 EASU test upscale path`
+## DX12 native settings overlay update
 
-This patch upgrades the confirmed-working DX12 RCAS post-process into a two-pass FSR1-style test pipeline:
+Suggested commit name: `Add native DX12 settings overlay`
 
-1. Copy the full-resolution swapchain backbuffer into a temporary source texture.
-2. Downscale that source into an internal low-resolution render target.
-3. Reconstruct the low-resolution image back to swapchain size with an EASU-inspired fullscreen shader.
-4. Apply the existing RCAS-style local-contrast limiter/sharpening in the final pass.
-
-This is a test upscaler path, not the final render-scale solution. The game still renders at native resolution first; the injector creates a lower-resolution internal source so we can verify that the EASU + RCAS resource path, barriers, descriptors, and fullscreen passes are stable in real DX12 games. A later patch can experiment with forcing lower game render resolution or using a game's own render-scale setting.
-
-Runtime toggles:
-
-- `Home`: toggles the DX12 EASU-style test upscale path on/off through the existing overlay-visible flag.
-- `FSRINJ_DX12_SHARPEN=0`: disables the DX12 post-process path.
-- `FSRINJ_DX12_SHARPNESS=0.0..1.0`: controls the RCAS-style final sharpness.
-- `FSRINJ_DX12_SCALE=0.50..1.00`: controls the internal test source scale. Default is `0.77`.
-
-Expected log lines:
-
-```text
-[overlay-dx12] EASU-style test upscale + RCAS pass initialized ... lowres=... scale=0.77 ...
-[overlay-dx12] init-only present skipped; EASU-style test upscale begins after warmup
-[overlay-dx12] warmup present 1/3; skipping EASU-style test upscale
-[overlay-dx12] first DX12 EASU-style test upscale + RCAS frame submitted successfully
-```
-
-Next milestone if this works:
-
-- Add a lower-risk forced render-scale experiment or game-resolution hook so the source image can come from the game at lower resolution instead of downscaling after the fact.
-- Add DX12 frame history capture for experimental frame generation.
+This build keeps Dear ImGui bypassed for DX12 and draws a lightweight native D3D12 overlay directly inside the working EASU/RCAS fullscreen pass. The overlay shows the DX12 UI header, post-process status, scale, sharpness, and a small scale bar. This follows the safer path used by mature DX12 overlays: separate capture/render backend from UI state, keep per-frame synchronization, and avoid the ImGui DX12 backend until descriptor/input issues are isolated.

@@ -47,16 +47,9 @@ Latest suggested commit name:
 Replace DX12 sharpen shader with RCAS-style pass
 ```
 
-## Suggested commit for this patch
 
-Commit name:
+## DX12 native settings overlay update
 
-```text
-Add DX12 EASU test upscale path
-```
+Suggested commit name: `Add native DX12 settings overlay`
 
-Commit description:
-
-```text
-Add a two-pass DX12 EASU-style test upscaler. The backend now downsamples the copied swapchain image into an internal low-resolution render target, reconstructs it back to swapchain size with an EASU-inspired shader, and applies the existing RCAS-style sharpening pass. Add FSRINJ_DX12_SCALE to control the internal test scale.
-```
+This build keeps Dear ImGui bypassed for DX12 and draws a lightweight native D3D12 overlay directly inside the working EASU/RCAS fullscreen pass. The overlay shows the DX12 UI header, post-process status, scale, sharpness, and a small scale bar. This follows the safer path used by mature DX12 overlays: separate capture/render backend from UI state, keep per-frame synchronization, and avoid the ImGui DX12 backend until descriptor/input issues are isolated.

@@ -122,6 +122,9 @@ the author of the scaffold; treat the COM/D3D specifics as needing a first build
 
 The DX12 path now has a fullscreen RCAS-style sharpening pass. This is not full FSR upscaling yet; it is the sharpening stage built on the working DX12 backbuffer post-process path. Use `FSRINJ_DX12_SHARPNESS=0.0..1.0` to tune strength, or `FSRINJ_DX12_SHARPEN=0` to disable it.
 
-## DX12 EASU-style test upscale
 
-The DX12 backend now includes an experimental EASU-style test upscale + RCAS post-process path. It copies the current swapchain image, creates an internal lower-resolution source, reconstructs it back to swapchain size, and applies RCAS-style sharpening. Use `FSRINJ_DX12_SCALE=0.50..1.00` to control the internal test scale. This verifies the DX12 upscaler pipeline; it does not yet force the game itself to render at lower resolution.
+## DX12 native settings overlay update
+
+Suggested commit name: `Add native DX12 settings overlay`
+
+This build keeps Dear ImGui bypassed for DX12 and draws a lightweight native D3D12 overlay directly inside the working EASU/RCAS fullscreen pass. The overlay shows the DX12 UI header, post-process status, scale, sharpness, and a small scale bar. This follows the safer path used by mature DX12 overlays: separate capture/render backend from UI state, keep per-frame synchronization, and avoid the ImGui DX12 backend until descriptor/input issues are isolated.
