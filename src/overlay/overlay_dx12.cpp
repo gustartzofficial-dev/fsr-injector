@@ -58,6 +58,13 @@ namespace {
     bool g_generated_ready = false;
     bool g_prev_left_mouse = false;
     bool g_inside_generated_present = false;
+    LARGE_INTEGER g_qpc_freq{};
+    LARGE_INTEGER g_fps_window_start{};
+    unsigned g_real_present_samples = 0;
+    unsigned g_generated_present_samples = 0;
+    unsigned g_generated_present_log_count = 0;
+    float g_real_fps = 0.0f;
+    float g_output_fps = 0.0f;
     float g_sharpness = 0.20f;
     float g_scale = 0.77f;
     UINT g_low_width = 0;
@@ -99,6 +106,27 @@ namespace {
         if (parsed < 0.50f) parsed = 0.50f;
         if (parsed > 1.00f) parsed = 1.00f;
         return parsed;
+    }
+
+    void update_fps_counters(unsigned generated_samples) {
+        if (g_qpc_freq.QuadPart == 0) {
+            QueryPerformanceFrequency(&g_qpc_freq);
+            QueryPerformanceCounter(&g_fps_window_start);
+        }
+        if (generated_samples) g_generated_present_samples += generated_samples;
+        else g_real_present_samples += 1;
+
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        const double elapsed = static_cast<double>(now.QuadPart - g_fps_window_start.QuadPart) /
+                               static_cast<double>(g_qpc_freq.QuadPart ? g_qpc_freq.QuadPart : 1);
+        if (elapsed >= 0.50) {
+            g_real_fps = static_cast<float>(static_cast<double>(g_real_present_samples) / elapsed);
+            g_output_fps = static_cast<float>(static_cast<double>(g_real_present_samples + g_generated_present_samples) / elapsed);
+            g_real_present_samples = 0;
+            g_generated_present_samples = 0;
+            g_fps_window_start = now;
+        }
     }
 
     D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu(UINT index) {
@@ -190,7 +218,7 @@ namespace {
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[1].Constants.ShaderRegister = 0;
         params[1].Constants.RegisterSpace = 0;
-        params[1].Constants.Num32BitValues = 11;
+        params[1].Constants.Num32BitValues = 13;
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -251,6 +279,8 @@ cbuffer Params : register(b0) {
     float historyReady;
     float interpOn;
     float genPresentOn;
+    float realFps;
+    float outputFps;
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -389,10 +419,22 @@ float text_pixel(uint ch0,uint ch1,uint ch2,uint ch3,uint ch4,uint ch5,uint ch6,
     return hit;
 }
 
+float number3_pixel(float value, float2 pos, float2 origin, float scale_px) {
+    uint v = (uint)round(clamp(value, 0.0, 999.0));
+    uint d0 = (v / 100u) % 10u;
+    uint d1 = (v / 10u) % 10u;
+    uint d2 = v % 10u;
+    float hit = 0.0;
+    hit = max(hit, glyph_pixel(48u + d0, pos, origin, scale_px));
+    hit = max(hit, glyph_pixel(48u + d1, pos, origin + float2(6.0 * scale_px, 0.0), scale_px));
+    hit = max(hit, glyph_pixel(48u + d2, pos, origin + float2(12.0 * scale_px, 0.0), scale_px));
+    return hit;
+}
+
 float3 draw_native_ui(float3 color, float2 pos) {
     if (overlayOn < 0.5) return color;
     float2 panelMin = float2(14.0, 14.0);
-    float2 panelMax = float2(286.0, 172.0);
+    float2 panelMax = float2(306.0, 224.0);
     float inside = step(panelMin.x, pos.x) * step(panelMin.y, pos.y) * step(pos.x, panelMax.x) * step(pos.y, panelMax.y);
     color = lerp(color, float3(0.025, 0.025, 0.032), inside * 0.72);
     float border = inside * (1.0 - step(panelMin.x + 2.0, pos.x) * step(panelMin.y + 2.0, pos.y) * step(pos.x, panelMax.x - 2.0) * step(pos.y, panelMax.y - 2.0));
@@ -405,11 +447,16 @@ float3 draw_native_ui(float3 color, float2 pos) {
     else white = max(white, text_pixel(80,79,83,84,32,79,70,70,32,32,32,32, pos, o + float2(0, 24), 2.0)); // POST OFF
     white = max(white, text_pixel(83,67,65,76,69,32,32,32,32,32,32,32, pos, o + float2(0, 44), 2.0)); // SCALE
     white = max(white, text_pixel(83,72,65,82,80,32,32,32,32,32,32,32, pos, o + float2(0, 66), 2.0)); // SHARP
-    if (interpOn > 0.5) white = max(white, text_pixel(70,52,32,80,82,69,86,32,79,78,32,32, pos, o + float2(0, 90), 2.0)); // F4 PREV ON
-    else white = max(white, text_pixel(70,52,32,80,82,69,86,32,79,70,70,32, pos, o + float2(0, 90), 2.0)); // F4 PREV OFF
+    if (interpOn > 0.5) white = max(white, text_pixel(70,52,32,77,79,84,78,32,79,78,32,32, pos, o + float2(0, 90), 2.0)); // F4 MOTN ON
+    else white = max(white, text_pixel(70,52,32,77,79,84,78,32,79,70,70,32, pos, o + float2(0, 90), 2.0)); // F4 MOTN OFF
     if (genPresentOn > 0.5) white = max(white, text_pixel(70,53,32,71,69,78,32,79,78,32,32,32, pos, o + float2(0, 114), 2.0)); // F5 GEN ON
     else white = max(white, text_pixel(70,53,32,71,69,78,32,79,70,70,32,32, pos, o + float2(0, 114), 2.0)); // F5 GEN OFF
     if (historyReady > 0.5) white = max(white, text_pixel(72,73,83,84,32,82,69,65,68,89,32,32, pos, o + float2(0, 138), 2.0)); // HIST READY
+    else white = max(white, text_pixel(72,73,83,84,32,87,65,82,77,32,32,32, pos, o + float2(0, 138), 2.0)); // HIST WARM
+    white = max(white, text_pixel(70,80,83,32,71,65,77,69,32,32,32,32, pos, o + float2(0, 162), 2.0)); // FPS GAME
+    white = max(white, number3_pixel(realFps, pos, o + float2(132, 162), 2.0));
+    white = max(white, text_pixel(70,80,83,32,79,85,84,32,32,32,32,32, pos, o + float2(0, 186), 2.0)); // FPS OUT
+    white = max(white, number3_pixel(outputFps, pos, o + float2(132, 186), 2.0));
     color = lerp(color, float3(0.92, 0.92, 0.95), white);
 
     float scaleBg = step(98.0, pos.x) * step(72.0, pos.y) * step(pos.x, 226.0) * step(pos.y, 78.0);
@@ -419,6 +466,58 @@ float3 draw_native_ui(float3 color, float2 pos) {
     color = lerp(color, float3(0.10, 0.10, 0.12), (scaleBg + sharpBg) * 0.80);
     color = lerp(color, float3(0.95, 0.18, 0.95), (scaleFill + sharpFill) * 0.80);
     return color;
+}
+
+
+float patch_error(float2 prevUv, float2 currUv) {
+    float2 px = invOutputSize;
+    float e = 0.0;
+    float3 p0 = gHistory.SampleLevel(gSampler, prevUv, 0.0).rgb;
+    float3 c0 = gInput.SampleLevel(gSampler, currUv, 0.0).rgb;
+    e += abs(luma(p0) - luma(c0)) * 2.0;
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2( px.x, 0.0), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2( px.x, 0.0), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(-px.x, 0.0), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(-px.x, 0.0), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(0.0,  px.y), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(0.0,  px.y), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(0.0, -px.y), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(0.0, -px.y), 0.0).rgb));
+    return e;
+}
+
+float2 estimate_optical_flow_lite(float2 uv, out float confidence) {
+    // Final-frame-only optical-flow-lite. This is not game motion vectors; it is a
+    // small block/patch search over previous/current backbuffers, similar in spirit
+    // to optical-flow estimation but cheap enough for the injector prototype.
+    float2 px = invOutputSize;
+    float best = 9999.0;
+    float second = 9999.0;
+    float2 bestOff = float2(0.0, 0.0);
+    [unroll] for (int y = -3; y <= 3; ++y) {
+        [unroll] for (int x = -3; x <= 3; ++x) {
+            float2 off = float2((float)x, (float)y) * px * 2.0;
+            float err = patch_error(uv, uv + off);
+            if (err < best) { second = best; best = err; bestOff = off; }
+            else if (err < second) second = err;
+        }
+    }
+    float ambiguity = saturate((second - best) * 4.0);
+    float quality = 1.0 - saturate(best * 1.6);
+    confidence = saturate(quality * (0.35 + 0.65 * ambiguity));
+    return bestOff;
+}
+
+float3 fsr3_lite_interpolate(float2 uv, float3 processedCurr) {
+    float conf = 0.0;
+    float2 flow = estimate_optical_flow_lite(uv, conf);
+    float3 prevWarp = gHistory.SampleLevel(gSampler, uv - flow * 0.50, 0.0).rgb;
+    float3 currWarp = gInput.SampleLevel(gSampler, uv + flow * 0.50, 0.0).rgb;
+    float3 motionFrame = lerp(prevWarp, currWarp, 0.50);
+    float3 simpleFrame = lerp(gHistory.SampleLevel(gSampler, uv, 0.0).rgb, processedCurr, 0.55);
+
+    // Reject likely disocclusion/scene-change pixels. This keeps fast cuts and UI
+    // from exploding into trails, falling back to the safer preview blend/current.
+    float lumDelta = abs(luma(gHistory.SampleLevel(gSampler, uv, 0.0).rgb) - luma(gInput.SampleLevel(gSampler, uv, 0.0).rgb));
+    float reject = saturate(lumDelta * 2.5);
+    float3 candidate = lerp(simpleFrame, motionFrame, conf);
+    return saturate(lerp(candidate, processedCurr, reject * 0.55));
 }
 
 float4 EasuRcasPS(VSOut i) : SV_Target {
@@ -431,11 +530,10 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         color = saturate(lerp(up, sharp, amount));
     }
     if (interpOn > 0.5 && historyReady > 0.5) {
-        float3 prev = gHistory.SampleLevel(gSampler, i.uv, 0.0).rgb;
-        // First experimental interpolation mode. This does not yet insert extra
-        // Presents; it validates the frame-history path by blending the current
-        // processed frame with the previous captured frame.
-        color = saturate(lerp(prev, color, 0.55));
+        // Motion-aware FSR3-lite preview. It estimates optical flow from the final
+        // backbuffers only, then blends a warped previous/current frame. This is
+        // still not native FSR3 because we do not have engine motion vectors/depth.
+        color = fsr3_lite_interpolate(i.uv, color);
     }
     color = draw_native_ui(color, i.pos.xy);
     return float4(color, base.a);
@@ -745,7 +843,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         LOGF("[overlay-dx12] FSR1-style EASU/RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off");
-        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=preview-interp F5=generated-present; mouse clicks supported");
+        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present; mouse clicks supported");
         return true;
     }
 
@@ -764,7 +862,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     void bind_fullscreen_state(D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height,
                                ID3D12PipelineState* pso,
                                float inv_x, float inv_y, float sharpness, float scale,
-                               bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled, bool gen_present_enabled) {
+                               bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled, bool gen_present_enabled,
+                               float real_fps, float output_fps) {
         D3D12_VIEWPORT vp{};
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
@@ -782,8 +881,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_cmd->SetPipelineState(pso);
         g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_cmd->SetGraphicsRootDescriptorTable(0, srv_gpu(0));
-        const float params[11] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f };
-        g_cmd->SetGraphicsRoot32BitConstants(1, 11, params, 0);
+        const float params[13] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f, real_fps, output_fps };
+        g_cmd->SetGraphicsRoot32BitConstants(1, 13, params, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
     }
 
@@ -806,7 +905,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
             bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso,
                                   1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
-                                  g_sharpness, g_scale, false, true, g_history_ready, g_interpolation_enabled, g_generated_present_enabled);
+                                  g_sharpness, g_scale, false, true, g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
+                                  g_real_fps, g_output_fps);
             transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             final_inv_x = 1.0f / static_cast<float>(g_low_width);
@@ -818,8 +918,9 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
             bind_fullscreen_state(g_generated_rtv, g_width, g_height, g_easu_rcas_pso,
                                   final_inv_x, final_inv_y,
-                                  g_sharpness, g_scale, false, g_effect_enabled,
-                                  true, true, g_generated_present_enabled);
+                                  g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
+                                  g_history_ready, true, g_generated_present_enabled,
+                                  g_real_fps, g_output_fps);
             transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_generated_ready = true;
@@ -831,7 +932,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         bind_fullscreen_state(f.rtv, g_width, g_height, g_easu_rcas_pso,
                               final_inv_x, final_inv_y,
                               g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
-                              g_history_ready, g_interpolation_enabled, g_generated_present_enabled);
+                              g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
+                              g_real_fps, g_output_fps);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g_input_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         transition(g_cmd, g_history, g_history_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -886,10 +988,11 @@ void handle_mouse_controls() {
         LOGF("[overlay-dx12] mouse: sharpness=%.2f", g_sharpness);
     } else if (inside(20, 112, 245, 132)) {
         g_interpolation_enabled = !g_interpolation_enabled;
-        LOGF("[overlay-dx12] mouse: preview interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
+        LOGF("[overlay-dx12] mouse: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
     } else if (inside(20, 136, 245, 156)) {
         g_generated_present_enabled = !g_generated_present_enabled;
         g_generated_ready = false;
+        g_generated_present_log_count = 0;
         LOGF("[overlay-dx12] mouse: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
     }
 
@@ -914,6 +1017,8 @@ bool on_present(IDXGISwapChain* sc) {
         LOGF("[overlay-dx12] init-only present skipped; FSR1-style upscale begins after warmup");
         return true;
     }
+
+    update_fps_counters(0);
 
     ++g_present_count;
     if ((g_effect_enabled || g_menu_visible || g_generated_present_enabled) && g_present_count <= kWarmupPresents) {
@@ -962,8 +1067,8 @@ bool on_present(IDXGISwapChain* sc) {
     if (pressed(VK_F1)) { g_scale = 0.77f; g_sharpness = 0.35f; recreate_scale_resources = true; LOGF("[overlay-dx12] F1 preset: Quality scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
     if (pressed(VK_F2)) { g_scale = 0.67f; g_sharpness = 0.45f; recreate_scale_resources = true; LOGF("[overlay-dx12] F2 preset: Balanced scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
     if (pressed(VK_F3)) { g_scale = 0.59f; g_sharpness = 0.55f; recreate_scale_resources = true; LOGF("[overlay-dx12] F3 preset: Performance scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
-    if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: preview interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
-    if (pressed(VK_F5)) { g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
+    if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
+    if (pressed(VK_F5)) { g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0; LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
 
     handle_mouse_controls();
 
@@ -1074,8 +1179,12 @@ void after_present(IDXGISwapChain* sc, unsigned int flags, PresentFn present_fn)
     g_inside_generated_present = true;
     HRESULT hr = present_fn(sc, 0, flags);
     g_inside_generated_present = false;
-    if (SUCCEEDED(hr)) LOGF("[overlay-dx12] experimental generated frame presented");
-    else LOGF("[overlay-dx12] generated Present failed hr=0x%08lX", hr);
+    if (SUCCEEDED(hr)) {
+        update_fps_counters(1);
+        ++g_generated_present_log_count;
+        if (g_generated_present_log_count == 1 || (g_generated_present_log_count % 120u) == 0u)
+            LOGF("[overlay-dx12] experimental generated frame presented count=%u", g_generated_present_log_count);
+    } else LOGF("[overlay-dx12] generated Present failed hr=0x%08lX", hr);
 }
 
 void after_present1(IDXGISwapChain1* sc, unsigned int flags, const DXGI_PRESENT_PARAMETERS* pp, Present1Fn present1_fn) {
@@ -1085,8 +1194,12 @@ void after_present1(IDXGISwapChain1* sc, unsigned int flags, const DXGI_PRESENT_
     const DXGI_PRESENT_PARAMETERS* use_pp = pp ? pp : &empty;
     HRESULT hr = present1_fn(sc, 0, flags, use_pp);
     g_inside_generated_present = false;
-    if (SUCCEEDED(hr)) LOGF("[overlay-dx12] experimental generated frame presented via Present1");
-    else LOGF("[overlay-dx12] generated Present1 failed hr=0x%08lX", hr);
+    if (SUCCEEDED(hr)) {
+        update_fps_counters(1);
+        ++g_generated_present_log_count;
+        if (g_generated_present_log_count == 1 || (g_generated_present_log_count % 120u) == 0u)
+            LOGF("[overlay-dx12] experimental generated frame presented via Present1 count=%u", g_generated_present_log_count);
+    } else LOGF("[overlay-dx12] generated Present1 failed hr=0x%08lX", hr);
 }
 
 void shutdown() {
@@ -1108,6 +1221,13 @@ void shutdown() {
     g_generated_ready = false;
     g_inside_generated_present = false;
     g_prev_left_mouse = false;
+    g_qpc_freq = LARGE_INTEGER{};
+    g_fps_window_start = LARGE_INTEGER{};
+    g_real_present_samples = 0;
+    g_generated_present_samples = 0;
+    g_generated_present_log_count = 0;
+    g_real_fps = 0.0f;
+    g_output_fps = 0.0f;
     g_sharpness = 0.20f;
     g_scale = 0.77f;
     g_present_count = 0;

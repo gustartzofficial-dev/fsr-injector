@@ -146,3 +146,21 @@ The menu should remain visible while the post-process effect is on or off. The p
 The DX12 path now includes an experimental generated-frame presentation mode. Press F5 to toggle it. F4 remains the safer interpolation preview mode that blends history into the real frame without inserting an extra Present.
 
 Suggested commit name for this update: `Add FSR1 pass and experimental generated frame presentation`
+
+### DX12 native menu FPS readout
+
+The DX12 native overlay now shows two FPS counters:
+
+- `FPS GAME`: the real game frame rate reaching the injector.
+- `FPS OUT`: estimated output present rate, including experimental generated-frame Presents when F5 is enabled.
+
+Controls:
+
+- `Home`: show/hide native menu
+- `End`: toggle DX12 post-process
+- `F4`: preview interpolation inside real frames
+- `F5`: experimental generated-frame presentation
+
+### DX12 FSR3-lite experiment
+
+The DX12 backend includes an experimental final-frame optical-flow-lite interpolation mode. It uses previous/current swapchain frames to estimate motion and is intended as a stepping stone toward real FSR3-style frame generation. It does not yet use native game motion vectors/depth.

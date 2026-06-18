@@ -175,3 +175,25 @@ Important: F5 is experimental. It renders an interpolated generated texture from
 ## Native DX12 menu usability update
 
 The overlay now displays F4 preview interpolation, F5 generated-frame presentation, and frame-history readiness directly in the panel. F5 was easy to miss in logs because the previous panel did not show generated-present state. Mouse click zones were added for POST toggle, scale bar, sharpness bar, F4 preview interpolation, and F5 generated-frame presentation.
+
+## DX12 menu FPS/flicker patch
+
+Commit suggestion: `Add DX12 FPS counter and stabilize generated-frame menu`
+
+- Adds native overlay FPS readouts:
+  - `FPS GAME` = real game Present rate seen by the hook.
+  - `FPS OUT` = estimated output present rate including experimental generated Presents.
+- Keeps the native menu visible on generated frames too, reducing the visible menu flicker when F5 generated-frame presentation is enabled.
+- Throttles generated-frame presentation logging so the log does not spam every generated frame.
+
+## FSR3-lite motion interpolation experiment
+
+This patch adds a motion-aware interpolation shader path for DX12. It estimates motion from the final previous/current backbuffers using a small patch search, then warps/blends the frames for F4 preview and the F5 generated-present texture.
+
+This is deliberately labelled FSR3-lite because it is not the AMD FidelityFX SDK FSR3 runtime yet. Real FSR3-quality frame generation expects richer engine data such as motion vectors, depth, jitter, exposure/reactive masks, UI handling, and frame-pacing integration. The injector now has a safer final-frame optical-flow fallback for games that expose only the swapchain.
+
+Controls:
+- F4: motion interpolation preview
+- F5: generated-frame presentation using the motion-interpolated texture
+- Home: menu
+- End: post-process
