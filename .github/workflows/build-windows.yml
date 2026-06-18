@@ -1,0 +1,44 @@
+name: Build Windows DLL
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: cmake -S . -B build -A x64 -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Find dxgi.dll
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path build -Recurse -Filter dxgi.dll | ForEach-Object {
+            Write-Host "Found: $($_.FullName)"
+            New-Item -ItemType Directory -Force -Path artifact
+            Copy-Item $_.FullName artifact/dxgi.dll -Force
+          }
+
+          if (!(Test-Path artifact/dxgi.dll)) {
+            Write-Error "dxgi.dll was not found in the build output."
+            exit 1
+          }
+
+      - name: Upload dxgi.dll artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsr-injector-dxgi-dll
+          path: artifact/dxgi.dll
