@@ -30,12 +30,16 @@ namespace {
     ID3D12GraphicsCommandList* g_cmd = nullptr;
     ID3D12Fence* g_fence = nullptr;
     ID3D12RootSignature* g_root_sig = nullptr;
-    ID3D12PipelineState* g_pso = nullptr;
+    ID3D12PipelineState* g_downscale_pso = nullptr;
+    ID3D12PipelineState* g_easu_rcas_pso = nullptr;
     ID3D12Resource* g_input = nullptr;
+    ID3D12Resource* g_lowres = nullptr;
     HANDLE g_fence_event = nullptr;
     UINT64 g_next_fence_value = 1;
     std::vector<FrameContext> g_frames;
     UINT g_rtv_stride = 0;
+    UINT g_srv_stride = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE g_lowres_rtv{};
     DXGI_FORMAT g_format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT g_width = 0;
     UINT g_height = 0;
@@ -43,9 +47,13 @@ namespace {
     bool g_sharpen_enabled = true;
     bool g_logged_first_effect = false;
     float g_sharpness = 0.20f;
+    float g_scale = 0.77f;
+    UINT g_low_width = 0;
+    UINT g_low_height = 0;
     unsigned g_present_count = 0;
     const unsigned kWarmupPresents = 3;
     D3D12_RESOURCE_STATES g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    D3D12_RESOURCE_STATES g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     template <class T>
     void safe_release(T*& p) {
@@ -70,6 +78,25 @@ namespace {
         if (parsed < 0.0f) parsed = 0.0f;
         if (parsed > 1.0f) parsed = 1.0f;
         return parsed;
+    }
+
+    float env_scale(const wchar_t* name, float fallback) {
+        float parsed = env_float(name, fallback);
+        if (parsed < 0.50f) parsed = 0.50f;
+        if (parsed > 1.00f) parsed = 1.00f;
+        return parsed;
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu(UINT index) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<SIZE_T>(index) * g_srv_stride;
+        return h;
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu(UINT index) {
+        D3D12_GPU_DESCRIPTOR_HANDLE h = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
+        h.ptr += static_cast<UINT64>(index) * static_cast<UINT64>(g_srv_stride);
+        return h;
     }
 
     bool wait_for_fence(UINT64 value) {
@@ -133,7 +160,7 @@ namespace {
         return true;
     }
 
-    bool create_sharpen_pipeline() {
+    bool create_upscale_pipeline() {
         D3D12_DESCRIPTOR_RANGE range{};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors = 1;
@@ -201,7 +228,7 @@ SamplerState gSampler : register(s0);
 cbuffer Params : register(b0) {
     float2 invSize;
     float sharpness;
-    float pad0;
+    float scale;
 };
 struct VSOut {
     float4 pos : SV_Position;
@@ -217,108 +244,151 @@ VSOut VSMain(uint id : SV_VertexID) {
     o.uv = float2(0.5 * p.x + 0.5, -0.5 * p.y + 0.5);
     return o;
 }
-float luma(float3 v) {
-    return dot(v, float3(0.2126, 0.7152, 0.0722));
-}
-float3 rcas_style(float2 uv) {
+float luma(float3 v) { return dot(v, float3(0.2126, 0.7152, 0.0722)); }
+
+float4 DownscalePS(VSOut i) : SV_Target {
+    // Test-source creation pass. The game still rendered at full resolution, so this
+    // pass intentionally makes an internal low-resolution source that lets us verify
+    // the EASU-style upscale + RCAS chain without forcing game resolution yet.
     float2 px = invSize;
+    float3 c = gInput.SampleLevel(gSampler, i.uv, 0.0).rgb * 0.40;
+    c += gInput.SampleLevel(gSampler, i.uv + float2( px.x, 0.0), 0.0).rgb * 0.15;
+    c += gInput.SampleLevel(gSampler, i.uv + float2(-px.x, 0.0), 0.0).rgb * 0.15;
+    c += gInput.SampleLevel(gSampler, i.uv + float2(0.0,  px.y), 0.0).rgb * 0.15;
+    c += gInput.SampleLevel(gSampler, i.uv + float2(0.0, -px.y), 0.0).rgb * 0.15;
+    float a = gInput.SampleLevel(gSampler, i.uv, 0.0).a;
+    return float4(c, a);
+}
+
+float3 rcas_style(float2 uv, float2 px, float strength) {
     float3 b = gInput.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
     float3 d = gInput.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
     float3 e = gInput.SampleLevel(gSampler, uv, 0.0).rgb;
     float3 f = gInput.SampleLevel(gSampler, uv + float2(px.x, 0.0), 0.0).rgb;
     float3 h = gInput.SampleLevel(gSampler, uv + float2(0.0, px.y), 0.0).rgb;
-
-    // RCAS-style robust limiter. This is intentionally self-contained HLSL for the
-    // injector path: it sharpens local contrast but limits gain near channel min/max
-    // to avoid the harsh clipping and halos of a plain unsharp mask.
     float3 mn = min(e, min(min(b, d), min(f, h)));
     float3 mx = max(e, max(max(b, d), max(f, h)));
     float3 local_range = max(mx - mn, 1.0 / 255.0);
-
     float center_luma = luma(e);
     float neighbor_luma = 0.25 * (luma(b) + luma(d) + luma(f) + luma(h));
     float detail = center_luma - neighbor_luma;
-
     float contrast = saturate(local_range.r * 0.299 + local_range.g * 0.587 + local_range.b * 0.114);
     float flat_suppression = saturate(contrast * 8.0);
     float edge_limit = 1.0 - saturate(abs(detail) * 4.0);
-    float gain = sharpness * 0.85 * flat_suppression * (0.35 + 0.65 * edge_limit);
-
+    float gain = strength * 0.85 * flat_suppression * (0.35 + 0.65 * edge_limit);
     float3 lap = 4.0 * e - (b + d + f + h);
     float3 outc = e + lap * gain * 0.25;
-
-    // Clamp to a softly expanded local range. This is the important RCAS-like part:
-    // let useful detail through, but prevent overshoot from producing obvious halos.
-    float3 margin = local_range * (0.20 + 0.35 * sharpness);
+    float3 margin = local_range * (0.20 + 0.35 * strength);
     return clamp(outc, mn - margin, mx + margin);
 }
-float4 PSMain(VSOut i) : SV_Target {
-    float4 c = gInput.SampleLevel(gSampler, i.uv, 0.0);
-    float3 outc = rcas_style(i.uv);
-    return float4(saturate(outc), c.a);
+
+float3 easu_style(float2 uv) {
+    // EASU-inspired reconstruction pass. This is intentionally dependency-free HLSL
+    // for the injector path; it is not a verbatim FidelityFX SDK shader yet. It uses
+    // directional luma gradients to bias the upscale taps away from high-contrast
+    // edges, then applies the existing RCAS-style limiter.
+    float2 px = invSize;
+    float3 c = gInput.SampleLevel(gSampler, uv, 0.0).rgb;
+    float3 l = gInput.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
+    float3 r = gInput.SampleLevel(gSampler, uv + float2( px.x, 0.0), 0.0).rgb;
+    float3 u = gInput.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
+    float3 d = gInput.SampleLevel(gSampler, uv + float2(0.0,  px.y), 0.0).rgb;
+    float3 lu = gInput.SampleLevel(gSampler, uv + float2(-px.x, -px.y), 0.0).rgb;
+    float3 ru = gInput.SampleLevel(gSampler, uv + float2( px.x, -px.y), 0.0).rgb;
+    float3 ld = gInput.SampleLevel(gSampler, uv + float2(-px.x,  px.y), 0.0).rgb;
+    float3 rd = gInput.SampleLevel(gSampler, uv + float2( px.x,  px.y), 0.0).rgb;
+
+    float gx = abs(luma(l) - luma(r)) + 0.5 * abs(luma(lu + ld) - luma(ru + rd));
+    float gy = abs(luma(u) - luma(d)) + 0.5 * abs(luma(lu + ru) - luma(ld + rd));
+    float wx = 1.0 / (0.015 + gx);
+    float wy = 1.0 / (0.015 + gy);
+
+    float3 axis = (l + r) * wx + (u + d) * wy;
+    axis /= max(2.0 * (wx + wy), 0.0001);
+    float3 diag = 0.25 * (lu + ru + ld + rd);
+    float edge = saturate(abs(gx - gy) * 6.0);
+    return lerp(0.55 * c + 0.35 * axis + 0.10 * diag, 0.72 * c + 0.28 * axis, edge);
+}
+
+float4 EasuRcasPS(VSOut i) : SV_Target {
+    float4 base = gInput.SampleLevel(gSampler, i.uv, 0.0);
+    float3 up = easu_style(i.uv);
+    float3 sharp = rcas_style(i.uv, invSize, sharpness);
+    float amount = saturate(0.45 + sharpness * 0.55);
+    return float4(saturate(lerp(up, sharp, amount)), base.a);
 }
 )HLSL";
 
         ID3DBlob* vs = nullptr;
-        ID3DBlob* ps = nullptr;
+        ID3DBlob* ps_down = nullptr;
+        ID3DBlob* ps_easu = nullptr;
         if (!compile_shader(hlsl, "VSMain", "vs_5_0", &vs)) return false;
-        if (!compile_shader(hlsl, "PSMain", "ps_5_0", &ps)) { vs->Release(); return false; }
+        if (!compile_shader(hlsl, "DownscalePS", "ps_5_0", &ps_down)) { vs->Release(); return false; }
+        if (!compile_shader(hlsl, "EasuRcasPS", "ps_5_0", &ps_easu)) { vs->Release(); ps_down->Release(); return false; }
 
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
-        pso.pRootSignature = g_root_sig;
-        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-        pso.BlendState.AlphaToCoverageEnable = FALSE;
-        pso.BlendState.IndependentBlendEnable = FALSE;
-        const D3D12_RENDER_TARGET_BLEND_DESC rt_blend = {
-            FALSE, FALSE,
-            D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-            D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
-            D3D12_LOGIC_OP_NOOP,
-            D3D12_COLOR_WRITE_ENABLE_ALL
+        auto fill_pso = [&](ID3DBlob* ps, ID3D12PipelineState** out) -> bool {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+            pso.pRootSignature = g_root_sig;
+            pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+            pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+            pso.BlendState.AlphaToCoverageEnable = FALSE;
+            pso.BlendState.IndependentBlendEnable = FALSE;
+            const D3D12_RENDER_TARGET_BLEND_DESC rt_blend = {
+                FALSE, FALSE,
+                D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+                D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD,
+                D3D12_LOGIC_OP_NOOP,
+                D3D12_COLOR_WRITE_ENABLE_ALL
+            };
+            for (auto& rt : pso.BlendState.RenderTarget) rt = rt_blend;
+            pso.SampleMask = UINT_MAX;
+            pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pso.RasterizerState.FrontCounterClockwise = FALSE;
+            pso.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+            pso.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+            pso.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+            pso.RasterizerState.DepthClipEnable = TRUE;
+            pso.RasterizerState.MultisampleEnable = FALSE;
+            pso.RasterizerState.AntialiasedLineEnable = FALSE;
+            pso.RasterizerState.ForcedSampleCount = 0;
+            pso.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+            pso.DepthStencilState.DepthEnable = FALSE;
+            pso.DepthStencilState.StencilEnable = FALSE;
+            pso.InputLayout = { nullptr, 0 };
+            pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            pso.NumRenderTargets = 1;
+            pso.RTVFormats[0] = g_format;
+            pso.SampleDesc.Count = 1;
+            pso.SampleDesc.Quality = 0;
+            HRESULT pso_hr = g_dev->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(out));
+            if (FAILED(pso_hr)) {
+                LOGF("[overlay-dx12] CreateGraphicsPipelineState failed hr=0x%08lX format=%u", pso_hr, (unsigned)g_format);
+                return false;
+            }
+            return true;
         };
-        for (auto& rt : pso.BlendState.RenderTarget) rt = rt_blend;
-        pso.SampleMask = UINT_MAX;
-        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-        pso.RasterizerState.FrontCounterClockwise = FALSE;
-        pso.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
-        pso.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-        pso.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
-        pso.RasterizerState.DepthClipEnable = TRUE;
-        pso.RasterizerState.MultisampleEnable = FALSE;
-        pso.RasterizerState.AntialiasedLineEnable = FALSE;
-        pso.RasterizerState.ForcedSampleCount = 0;
-        pso.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-        pso.DepthStencilState.DepthEnable = FALSE;
-        pso.DepthStencilState.StencilEnable = FALSE;
-        pso.InputLayout = { nullptr, 0 };
-        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        pso.NumRenderTargets = 1;
-        pso.RTVFormats[0] = g_format;
-        pso.SampleDesc.Count = 1;
-        pso.SampleDesc.Quality = 0;
 
-        hr = g_dev->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&g_pso));
+        bool ok = fill_pso(ps_down, &g_downscale_pso) && fill_pso(ps_easu, &g_easu_rcas_pso);
         vs->Release();
-        ps->Release();
-        if (FAILED(hr)) {
-            LOGF("[overlay-dx12] CreateGraphicsPipelineState failed hr=0x%08lX format=%u", hr, (unsigned)g_format);
-            return false;
-        }
-        return true;
+        ps_down->Release();
+        ps_easu->Release();
+        return ok;
     }
 
-    bool create_input_texture_from_backbuffer(ID3D12Resource* backbuffer) {
+    bool create_upscale_resources_from_backbuffer(ID3D12Resource* backbuffer) {
         if (!backbuffer) return false;
         D3D12_RESOURCE_DESC desc = backbuffer->GetDesc();
         g_width = static_cast<UINT>(desc.Width);
         g_height = desc.Height;
         g_format = desc.Format == DXGI_FORMAT_UNKNOWN ? g_format : desc.Format;
-        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        desc.SampleDesc.Count = 1;
-        desc.SampleDesc.Quality = 0;
+
+        g_low_width = static_cast<UINT>(static_cast<float>(g_width) * g_scale + 0.5f);
+        g_low_height = static_cast<UINT>(static_cast<float>(g_height) * g_scale + 0.5f);
+        if (g_low_width < 16) g_low_width = 16;
+        if (g_low_height < 16) g_low_height = 16;
+        if (g_low_width > g_width) g_low_width = g_width;
+        if (g_low_height > g_height) g_low_height = g_height;
 
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -327,7 +397,13 @@ float4 PSMain(VSOut i) : SV_Target {
         heap.CreationNodeMask = 1;
         heap.VisibleNodeMask = 1;
 
-        HRESULT hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_DESC input_desc = desc;
+        input_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        input_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        input_desc.SampleDesc.Count = 1;
+        input_desc.SampleDesc.Quality = 0;
+
+        HRESULT hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &input_desc,
                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                     IID_PPV_ARGS(&g_input));
         if (FAILED(hr)) {
@@ -336,15 +412,35 @@ float4 PSMain(VSOut i) : SV_Target {
         }
         g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
+        D3D12_RESOURCE_DESC low_desc = input_desc;
+        low_desc.Width = g_low_width;
+        low_desc.Height = g_low_height;
+        low_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_CLEAR_VALUE clear{};
+        clear.Format = g_format;
+        clear.Color[0] = 0.0f;
+        clear.Color[1] = 0.0f;
+        clear.Color[2] = 0.0f;
+        clear.Color[3] = 1.0f;
+        hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &low_desc,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET, &clear,
+                                            IID_PPV_ARGS(&g_lowres));
+        if (FAILED(hr)) {
+            LOGF("[overlay-dx12] CreateCommittedResource(lowres texture) failed hr=0x%08lX %ux%u fmt=%u", hr, g_low_width, g_low_height, (unsigned)g_format);
+            return false;
+        }
+        g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
         D3D12_DESCRIPTOR_HEAP_DESC srv_desc{};
         srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srv_desc.NumDescriptors = 1;
+        srv_desc.NumDescriptors = 2;
         srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_srv_heap));
         if (FAILED(hr)) {
             LOGF("[overlay-dx12] CreateDescriptorHeap(SRV) failed hr=0x%08lX", hr);
             return false;
         }
+        g_srv_stride = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
         D3D12_SHADER_RESOURCE_VIEW_DESC view{};
         view.Format = g_format;
@@ -354,7 +450,8 @@ float4 PSMain(VSOut i) : SV_Target {
         view.Texture2D.MostDetailedMip = 0;
         view.Texture2D.PlaneSlice = 0;
         view.Texture2D.ResourceMinLODClamp = 0.0f;
-        g_dev->CreateShaderResourceView(g_input, &view, g_srv_heap->GetCPUDescriptorHandleForHeapStart());
+        g_dev->CreateShaderResourceView(g_input, &view, srv_cpu(0));
+        g_dev->CreateShaderResourceView(g_lowres, &view, srv_cpu(1));
         return true;
     }
 
@@ -368,13 +465,18 @@ float4 PSMain(VSOut i) : SV_Target {
         g_frames.clear();
         safe_release(g_cmd);
         safe_release(g_input);
+        safe_release(g_lowres);
         safe_release(g_srv_heap);
-        safe_release(g_pso);
+        safe_release(g_downscale_pso);
+        safe_release(g_easu_rcas_pso);
         safe_release(g_root_sig);
         safe_release(g_rtv_heap);
         g_width = 0;
         g_height = 0;
+        g_low_width = 0;
+        g_low_height = 0;
         g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
 
     bool create_render_targets(IDXGISwapChain* sc) {
@@ -389,7 +491,7 @@ float4 PSMain(VSOut i) : SV_Target {
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
         rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv_desc.NumDescriptors = buffer_count;
+        rtv_desc.NumDescriptors = buffer_count + 1;
         hr = g_dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&g_rtv_heap));
         if (FAILED(hr)) {
             LOGF("[overlay-dx12] CreateDescriptorHeap(RTV) failed hr=0x%08lX", hr);
@@ -421,8 +523,10 @@ float4 PSMain(VSOut i) : SV_Target {
             cpu.ptr += g_rtv_stride;
         }
 
-        if (!create_input_texture_from_backbuffer(g_frames[0].backbuffer)) return false;
-        if (!create_sharpen_pipeline()) return false;
+        g_lowres_rtv = cpu;
+        if (!create_upscale_resources_from_backbuffer(g_frames[0].backbuffer)) return false;
+        g_dev->CreateRenderTargetView(g_lowres, nullptr, g_lowres_rtv);
+        if (!create_upscale_pipeline()) return false;
 
         hr = g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_cmd));
         if (FAILED(hr)) {
@@ -457,6 +561,7 @@ float4 PSMain(VSOut i) : SV_Target {
         g_sharpen_enabled = !env_disabled(L"FSRINJ_DX12_SHARPEN");
         g_sharpness = env_float(L"FSRINJ_DX12_SHARPNESS", core::config().sharpness.load());
         if (g_sharpness <= 0.0f) g_sharpness = 0.20f;
+        g_scale = env_scale(L"FSRINJ_DX12_SCALE", 0.77f);
 
         hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         if (FAILED(hr)) {
@@ -471,10 +576,10 @@ float4 PSMain(VSOut i) : SV_Target {
 
         if (!create_render_targets(sc)) return false;
 
-        LOGF("[overlay-dx12] RCAS-style sharpen pass initialized on hwnd %p buffers=%u size=%ux%u format=%u queue=%p enabled=%s sharpness=%.2f",
-             static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, (unsigned)g_format,
+        LOGF("[overlay-dx12] EASU-style test upscale + RCAS pass initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f",
+             static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_sharpen_enabled ? "on" : "off", g_sharpness);
-        LOGF("[overlay-dx12] Dear ImGui is still bypassed on DX12; Home toggles the DX12 RCAS-style sharpen pass");
+        LOGF("[overlay-dx12] Dear ImGui is still bypassed on DX12; Home toggles the DX12 EASU-style test upscale path");
         return true;
     }
 
@@ -490,9 +595,34 @@ float4 PSMain(VSOut i) : SV_Target {
         cmd->ResourceBarrier(1, &b);
     }
 
-    bool render_sharpen(FrameContext& f) {
-        if (!g_input || !g_srv_heap || !g_pso || !g_root_sig) return false;
-        if (g_width == 0 || g_height == 0) return false;
+    void bind_fullscreen_state(D3D12_CPU_DESCRIPTOR_HANDLE rtv, UINT width, UINT height,
+                               ID3D12PipelineState* pso, D3D12_GPU_DESCRIPTOR_HANDLE srv,
+                               float inv_x, float inv_y, float sharpness, float scale) {
+        D3D12_VIEWPORT vp{};
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width = static_cast<float>(width);
+        vp.Height = static_cast<float>(height);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        D3D12_RECT scissor{ 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
+        g_cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        g_cmd->RSSetViewports(1, &vp);
+        g_cmd->RSSetScissorRects(1, &scissor);
+        ID3D12DescriptorHeap* heaps[] = { g_srv_heap };
+        g_cmd->SetDescriptorHeaps(1, heaps);
+        g_cmd->SetGraphicsRootSignature(g_root_sig);
+        g_cmd->SetPipelineState(pso);
+        g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_cmd->SetGraphicsRootDescriptorTable(0, srv);
+        const float params[4] = { inv_x, inv_y, sharpness, scale };
+        g_cmd->SetGraphicsRoot32BitConstants(1, 4, params, 0);
+        g_cmd->DrawInstanced(3, 1, 0, 0);
+    }
+
+    bool render_upscale(FrameContext& f) {
+        if (!g_input || !g_lowres || !g_srv_heap || !g_downscale_pso || !g_easu_rcas_pso || !g_root_sig) return false;
+        if (g_width == 0 || g_height == 0 || g_low_width == 0 || g_low_height == 0) return false;
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -500,33 +630,23 @@ float4 PSMain(VSOut i) : SV_Target {
         g_cmd->CopyResource(g_input, f.backbuffer);
         transition(g_cmd, g_input, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         g_input_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        transition(g_cmd, g_lowres, g_lowres_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso, srv_gpu(0),
+                              1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
+                              g_sharpness, g_scale);
+        transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-        D3D12_VIEWPORT vp{};
-        vp.TopLeftX = 0.0f;
-        vp.TopLeftY = 0.0f;
-        vp.Width = static_cast<float>(g_width);
-        vp.Height = static_cast<float>(g_height);
-        vp.MinDepth = 0.0f;
-        vp.MaxDepth = 1.0f;
-        D3D12_RECT scissor{ 0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height) };
-
-        g_cmd->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
-        g_cmd->RSSetViewports(1, &vp);
-        g_cmd->RSSetScissorRects(1, &scissor);
-        ID3D12DescriptorHeap* heaps[] = { g_srv_heap };
-        g_cmd->SetDescriptorHeaps(1, heaps);
-        g_cmd->SetGraphicsRootSignature(g_root_sig);
-        g_cmd->SetPipelineState(g_pso);
-        g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        g_cmd->SetGraphicsRootDescriptorTable(0, g_srv_heap->GetGPUDescriptorHandleForHeapStart());
-        const float params[4] = { 1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height), g_sharpness, 0.0f };
-        g_cmd->SetGraphicsRoot32BitConstants(1, 4, params, 0);
-        g_cmd->DrawInstanced(3, 1, 0, 0);
-
+        bind_fullscreen_state(f.rtv, g_width, g_height, g_easu_rcas_pso, srv_gpu(1),
+                              1.0f / static_cast<float>(g_low_width), 1.0f / static_cast<float>(g_low_height),
+                              g_sharpness, g_scale);
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         return true;
     }
+
 }
 
 bool on_present(IDXGISwapChain* sc) {
@@ -534,13 +654,13 @@ bool on_present(IDXGISwapChain* sc) {
         if (!init(sc)) return false;
         g_init = true;
         g_present_count = 0;
-        LOGF("[overlay-dx12] init-only present skipped; sharpen begins after warmup");
+        LOGF("[overlay-dx12] init-only present skipped; EASU-style test upscale begins after warmup");
         return true;
     }
 
     ++g_present_count;
     if (g_sharpen_enabled && g_present_count <= kWarmupPresents) {
-        LOGF("[overlay-dx12] warmup present %u/%u; skipping sharpen", g_present_count, kWarmupPresents);
+        LOGF("[overlay-dx12] warmup present %u/%u; skipping EASU-style test upscale", g_present_count, kWarmupPresents);
         return true;
     }
 
@@ -549,7 +669,7 @@ bool on_present(IDXGISwapChain* sc) {
     if (down && !prev) {
         bool v = core::config().overlay_visible.load();
         core::config().overlay_visible.store(!v);
-        LOGF("[overlay-dx12] Home toggle: DX12 sharpen %s", !v ? "visible/enabled" : "hidden/disabled");
+        LOGF("[overlay-dx12] Home toggle: DX12 EASU-style test upscale %s", !v ? "visible/enabled" : "hidden/disabled");
     }
     prev = down;
 
@@ -576,8 +696,8 @@ bool on_present(IDXGISwapChain* sc) {
         return true;
     }
 
-    if (!render_sharpen(f)) {
-        LOGF("[overlay-dx12] render_sharpen returned false; skipping frame");
+    if (!render_upscale(f)) {
+        LOGF("[overlay-dx12] render_upscale returned false; skipping frame");
         g_cmd->Close();
         return true;
     }
@@ -592,7 +712,7 @@ bool on_present(IDXGISwapChain* sc) {
     g_queue->ExecuteCommandLists(1, lists);
     signal_frame(f);
     if (!g_logged_first_effect) {
-        LOGF("[overlay-dx12] first DX12 RCAS-style sharpen frame submitted successfully");
+        LOGF("[overlay-dx12] first DX12 EASU-style test upscale + RCAS frame submitted successfully");
         g_logged_first_effect = true;
     }
     return true;
@@ -601,11 +721,11 @@ bool on_present(IDXGISwapChain* sc) {
 void on_resize_buffers() { release_frame_resources(); }
 void on_after_resize(IDXGISwapChain* sc) {
     if (g_init && g_dev) {
-        if (!create_render_targets(sc)) LOGF("[overlay-dx12] recreate RCAS-style sharpen resources failed after ResizeBuffers");
+        if (!create_render_targets(sc)) LOGF("[overlay-dx12] recreate EASU-style test upscale resources failed after ResizeBuffers");
         else {
             g_present_count = 0;
             g_logged_first_effect = false;
-            LOGF("[overlay-dx12] RCAS-style sharpen resources recreated after ResizeBuffers");
+            LOGF("[overlay-dx12] EASU-style test upscale resources recreated after ResizeBuffers");
         }
     }
 }
@@ -622,6 +742,7 @@ void shutdown() {
     g_sharpen_enabled = true;
     g_logged_first_effect = false;
     g_sharpness = 0.20f;
+    g_scale = 0.77f;
     g_present_count = 0;
     g_init = false;
 }

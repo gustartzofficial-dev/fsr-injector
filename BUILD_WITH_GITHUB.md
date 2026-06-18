@@ -46,3 +46,17 @@ Latest suggested commit name:
 ```text
 Replace DX12 sharpen shader with RCAS-style pass
 ```
+
+## Suggested commit for this patch
+
+Commit name:
+
+```text
+Add DX12 EASU test upscale path
+```
+
+Commit description:
+
+```text
+Add a two-pass DX12 EASU-style test upscaler. The backend now downsamples the copied swapchain image into an internal low-resolution render target, reconstructs it back to swapchain size with an EASU-inspired shader, and applies the existing RCAS-style sharpening pass. Add FSRINJ_DX12_SCALE to control the internal test scale.
+```
