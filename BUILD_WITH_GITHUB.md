@@ -39,3 +39,10 @@ For the DX12 foundation patch, check the log for messages like:
 - The workflow uses `windows-latest`, Visual Studio 2022, x64, and Release config.
 - Dependencies such as MinHook and Dear ImGui are fetched by CMake during the build.
 - If Dear ImGui changes its DX12 backend API on `master`, the build may fail. In that case, pin ImGui in `CMakeLists.txt` to a known commit/tag or update the DX12 backend init call.
+
+
+Latest suggested commit name:
+
+```text
+Replace DX12 sharpen shader with RCAS-style pass
+```

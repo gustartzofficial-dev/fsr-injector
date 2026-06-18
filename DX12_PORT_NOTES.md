@@ -112,3 +112,16 @@ Next milestone if this works:
 
 - Replace this simple sharpening shader with a FidelityFX-style RCAS pass.
 - Then add an EASU/FSR1-style spatial upscaler path using the same backbuffer copy and fullscreen render infrastructure.
+
+
+## Patch: DX12 RCAS-style sharpen pass
+
+Suggested commit name: `Replace DX12 sharpen shader with RCAS-style pass`
+
+This patch replaces the initial simple DX12 unsharp-mask shader with a more robust RCAS-style local-contrast sharpening pass. It keeps the already-working DX12 backbuffer copy and fullscreen render pipeline, but changes the pixel shader to use a local min/max limiter so sharpening is less halo-prone and closer to the FSR1 RCAS stage. Dear ImGui remains bypassed for DX12 while the graphics backend matures.
+
+Runtime toggles:
+
+- `Home`: toggles the DX12 sharpen pass on/off through the existing overlay-visible flag.
+- `FSRINJ_DX12_SHARPEN=0`: disables the DX12 sharpen pass.
+- `FSRINJ_DX12_SHARPNESS=0.0..1.0`: controls RCAS-style sharpness.

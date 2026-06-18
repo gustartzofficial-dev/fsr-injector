@@ -116,3 +116,8 @@ buildable. The FSR boundary is defined as an interface (`fsr/fsr_integration.h`)
 with honest stubs — wiring it to the FidelityFX SDK is the next phase and needs a
 GPU + iteration to get right. Nothing here has been compiled or run on hardware by
 the author of the scaffold; treat the COM/D3D specifics as needing a first build pass.
+
+
+### DX12 RCAS-style sharpening
+
+The DX12 path now has a fullscreen RCAS-style sharpening pass. This is not full FSR upscaling yet; it is the sharpening stage built on the working DX12 backbuffer post-process path. Use `FSRINJ_DX12_SHARPNESS=0.0..1.0` to tune strength, or `FSRINJ_DX12_SHARPEN=0` to disable it.

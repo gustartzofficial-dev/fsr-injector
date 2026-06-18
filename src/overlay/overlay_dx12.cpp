@@ -217,17 +217,45 @@ VSOut VSMain(uint id : SV_VertexID) {
     o.uv = float2(0.5 * p.x + 0.5, -0.5 * p.y + 0.5);
     return o;
 }
-float4 PSMain(VSOut i) : SV_Target {
+float luma(float3 v) {
+    return dot(v, float3(0.2126, 0.7152, 0.0722));
+}
+float3 rcas_style(float2 uv) {
     float2 px = invSize;
+    float3 b = gInput.SampleLevel(gSampler, uv + float2(0.0, -px.y), 0.0).rgb;
+    float3 d = gInput.SampleLevel(gSampler, uv + float2(-px.x, 0.0), 0.0).rgb;
+    float3 e = gInput.SampleLevel(gSampler, uv, 0.0).rgb;
+    float3 f = gInput.SampleLevel(gSampler, uv + float2(px.x, 0.0), 0.0).rgb;
+    float3 h = gInput.SampleLevel(gSampler, uv + float2(0.0, px.y), 0.0).rgb;
+
+    // RCAS-style robust limiter. This is intentionally self-contained HLSL for the
+    // injector path: it sharpens local contrast but limits gain near channel min/max
+    // to avoid the harsh clipping and halos of a plain unsharp mask.
+    float3 mn = min(e, min(min(b, d), min(f, h)));
+    float3 mx = max(e, max(max(b, d), max(f, h)));
+    float3 local_range = max(mx - mn, 1.0 / 255.0);
+
+    float center_luma = luma(e);
+    float neighbor_luma = 0.25 * (luma(b) + luma(d) + luma(f) + luma(h));
+    float detail = center_luma - neighbor_luma;
+
+    float contrast = saturate(local_range.r * 0.299 + local_range.g * 0.587 + local_range.b * 0.114);
+    float flat_suppression = saturate(contrast * 8.0);
+    float edge_limit = 1.0 - saturate(abs(detail) * 4.0);
+    float gain = sharpness * 0.85 * flat_suppression * (0.35 + 0.65 * edge_limit);
+
+    float3 lap = 4.0 * e - (b + d + f + h);
+    float3 outc = e + lap * gain * 0.25;
+
+    // Clamp to a softly expanded local range. This is the important RCAS-like part:
+    // let useful detail through, but prevent overshoot from producing obvious halos.
+    float3 margin = local_range * (0.20 + 0.35 * sharpness);
+    return clamp(outc, mn - margin, mx + margin);
+}
+float4 PSMain(VSOut i) : SV_Target {
     float4 c = gInput.SampleLevel(gSampler, i.uv, 0.0);
-    float4 l = gInput.SampleLevel(gSampler, i.uv + float2(-px.x, 0.0), 0.0);
-    float4 r = gInput.SampleLevel(gSampler, i.uv + float2( px.x, 0.0), 0.0);
-    float4 u = gInput.SampleLevel(gSampler, i.uv + float2(0.0, -px.y), 0.0);
-    float4 d = gInput.SampleLevel(gSampler, i.uv + float2(0.0,  px.y), 0.0);
-    float a = sharpness * 0.35;
-    float4 outc = c * (1.0 + 4.0 * a) - (l + r + u + d) * a;
-    outc.a = c.a;
-    return saturate(outc);
+    float3 outc = rcas_style(i.uv);
+    return float4(saturate(outc), c.a);
 }
 )HLSL";
 
@@ -443,10 +471,10 @@ float4 PSMain(VSOut i) : SV_Target {
 
         if (!create_render_targets(sc)) return false;
 
-        LOGF("[overlay-dx12] sharpen pass initialized on hwnd %p buffers=%u size=%ux%u format=%u queue=%p enabled=%s sharpness=%.2f",
+        LOGF("[overlay-dx12] RCAS-style sharpen pass initialized on hwnd %p buffers=%u size=%ux%u format=%u queue=%p enabled=%s sharpness=%.2f",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, (unsigned)g_format,
              static_cast<void*>(g_queue), g_sharpen_enabled ? "on" : "off", g_sharpness);
-        LOGF("[overlay-dx12] Dear ImGui is still bypassed on DX12; Home toggles the DX12 sharpen pass");
+        LOGF("[overlay-dx12] Dear ImGui is still bypassed on DX12; Home toggles the DX12 RCAS-style sharpen pass");
         return true;
     }
 
@@ -564,7 +592,7 @@ bool on_present(IDXGISwapChain* sc) {
     g_queue->ExecuteCommandLists(1, lists);
     signal_frame(f);
     if (!g_logged_first_effect) {
-        LOGF("[overlay-dx12] first DX12 sharpen frame submitted successfully");
+        LOGF("[overlay-dx12] first DX12 RCAS-style sharpen frame submitted successfully");
         g_logged_first_effect = true;
     }
     return true;
@@ -573,11 +601,11 @@ bool on_present(IDXGISwapChain* sc) {
 void on_resize_buffers() { release_frame_resources(); }
 void on_after_resize(IDXGISwapChain* sc) {
     if (g_init && g_dev) {
-        if (!create_render_targets(sc)) LOGF("[overlay-dx12] recreate sharpen resources failed after ResizeBuffers");
+        if (!create_render_targets(sc)) LOGF("[overlay-dx12] recreate RCAS-style sharpen resources failed after ResizeBuffers");
         else {
             g_present_count = 0;
             g_logged_first_effect = false;
-            LOGF("[overlay-dx12] sharpen resources recreated after ResizeBuffers");
+            LOGF("[overlay-dx12] RCAS-style sharpen resources recreated after ResizeBuffers");
         }
     }
 }
