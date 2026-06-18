@@ -44,6 +44,8 @@ namespace {
     detect::DetectResult g_profile;
     bool g_profile_done = false;
     bool g_render_enabled = true;
+    unsigned g_present_count = 0;
+    const unsigned kWarmupPresents = 3;
 
     bool env_disabled(const wchar_t* name) {
         wchar_t value[16]{};
@@ -258,6 +260,15 @@ bool on_present(IDXGISwapChain* sc) {
     if (!g_init) {
         if (!init(sc)) return false;
         g_init = true;
+        g_present_count = 0;
+        LOGF("[overlay-dx12] init-only present skipped; render begins after warmup");
+        return true;
+    }
+
+    ++g_present_count;
+    if (g_render_enabled && g_present_count <= kWarmupPresents) {
+        LOGF("[overlay-dx12] warmup present %u/%u; skipping render", g_present_count, kWarmupPresents);
+        return true;
     }
 
     static bool prev = false;
@@ -271,17 +282,21 @@ bool on_present(IDXGISwapChain* sc) {
     if (!g_render_enabled) return true;
     if (!core::config().overlay_visible.load()) return true;
 
+    LOGF("[overlay-dx12] render begin present=%u", g_present_count);
+
     const UINT idx = g_sc3 ? g_sc3->GetCurrentBackBufferIndex() : 0;
     if (idx >= g_frames.size()) return true;
     FrameContext& f = g_frames[idx];
     if (!f.allocator || !f.backbuffer || !g_cmd || !g_queue) return true;
     if (!wait_for_frame(f)) return true;
 
+    LOGF("[overlay-dx12] step: allocator reset idx=%u", idx);
     HRESULT hr = f.allocator->Reset();
     if (FAILED(hr)) {
         LOGF("[overlay-dx12] allocator Reset failed hr=0x%08lX", hr);
         return true;
     }
+    LOGF("[overlay-dx12] step: command list reset");
     hr = g_cmd->Reset(f.allocator, nullptr);
     if (FAILED(hr)) {
         LOGF("[overlay-dx12] command list Reset failed hr=0x%08lX", hr);
@@ -294,24 +309,33 @@ bool on_present(IDXGISwapChain* sc) {
     b1.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
     b1.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b1.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    LOGF("[overlay-dx12] step: barrier present->rt");
     g_cmd->ResourceBarrier(1, &b1);
 
+    LOGF("[overlay-dx12] step: OMSetRenderTargets");
     g_cmd->OMSetRenderTargets(1, &f.rtv, FALSE, nullptr);
     ID3D12DescriptorHeap* heaps[] = { g_srv_heap };
+    LOGF("[overlay-dx12] step: SetDescriptorHeaps");
     g_cmd->SetDescriptorHeaps(1, heaps);
 
+    LOGF("[overlay-dx12] step: ImGui new frame");
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
+    LOGF("[overlay-dx12] step: draw menu");
     draw_menu();
+    LOGF("[overlay-dx12] step: ImGui render");
     ImGui::Render();
+    LOGF("[overlay-dx12] step: ImGui DX12 render draw data");
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_cmd);
 
     D3D12_RESOURCE_BARRIER b2 = b1;
     b2.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b2.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    LOGF("[overlay-dx12] step: barrier rt->present");
     g_cmd->ResourceBarrier(1, &b2);
 
+    LOGF("[overlay-dx12] step: command list close");
     hr = g_cmd->Close();
     if (FAILED(hr)) {
         LOGF("[overlay-dx12] command list Close failed hr=0x%08lX", hr);
@@ -319,8 +343,11 @@ bool on_present(IDXGISwapChain* sc) {
     }
 
     ID3D12CommandList* lists[] = { g_cmd };
+    LOGF("[overlay-dx12] step: ExecuteCommandLists");
     g_queue->ExecuteCommandLists(1, lists);
+    LOGF("[overlay-dx12] step: Signal fence");
     signal_frame(f);
+    LOGF("[overlay-dx12] render end");
     return true;
 }
 
@@ -348,6 +375,7 @@ void shutdown() {
     if (g_sc3) { g_sc3->Release(); g_sc3 = nullptr; }
     g_next_fence_value = 1;
     g_render_enabled = true;
+    g_present_count = 0;
     g_init = false;
 }
 

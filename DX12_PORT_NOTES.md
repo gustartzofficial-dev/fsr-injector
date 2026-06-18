@@ -63,3 +63,21 @@ To temporarily disable only DX12 overlay drawing while keeping queue capture act
 ```bat
 set FSRINJ_DX12_OVERLAY=0
 ```
+
+## DX12 staged overlay diagnostics
+
+The DX12 overlay now skips the first Present that performs initialization and waits three additional Presents before attempting to render. This avoids submitting command lists while the game's swapchain is still settling and adds log markers before every risky D3D12 step:
+
+- allocator reset
+- command list reset
+- PRESENT -> RENDER_TARGET barrier
+- render target binding
+- descriptor heap binding
+- ImGui frame creation
+- ImGui draw data recording
+- RENDER_TARGET -> PRESENT barrier
+- command list close
+- ExecuteCommandLists
+- fence signal
+
+If a game still closes instantly, the last emitted `[overlay-dx12] step:` line identifies the failing stage.
