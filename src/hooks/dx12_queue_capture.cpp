@@ -93,7 +93,7 @@ namespace {
 
     void STDMETHODCALLTYPE hk_ResourceBarrier(ID3D12GraphicsCommandList* list, UINT count,
                                               const D3D12_RESOURCE_BARRIER* barriers) {
-        capture::scout::note_dx12_resource_barrier(count);
+        capture::scout::note_dx12_resource_barrier(count, barriers);
         g_orig_resource_barrier(list, count, barriers);
     }
 

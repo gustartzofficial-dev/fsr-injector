@@ -20,6 +20,8 @@ namespace {
         bool motion_candidate = false;
         unsigned bind_count = 0;
         ID3D12Resource* resource = nullptr; // raw pointer; AddRef only during acquire.
+        bool state_known = false;
+        D3D12_RESOURCE_STATES last_state = D3D12_RESOURCE_STATE_COMMON;
     };
 
     std::mutex g_mtx;
@@ -122,7 +124,23 @@ void note_final_frame_motion(bool available) { std::lock_guard<std::mutex> lk(g_
 void note_dx12_command_list_seen() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_command_lists_seen; }
 void note_dx12_execute_call(unsigned command_list_count) { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_execute_calls; g_state.dx12_command_lists_seen += command_list_count; }
 void note_dx12_draw_call(bool) { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_draw_calls; }
-void note_dx12_resource_barrier(unsigned count) { std::lock_guard<std::mutex> lk(g_mtx); g_state.dx12_resource_barriers += count; }
+void note_dx12_resource_barrier(unsigned count, const D3D12_RESOURCE_BARRIER* barriers) {
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_state.dx12_resource_barriers += count;
+    if (!barriers) return;
+    for (unsigned i = 0; i < count; ++i) {
+        const D3D12_RESOURCE_BARRIER& b = barriers[i];
+        if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource) continue;
+        ID3D12Resource* res = b.Transition.pResource;
+        for (auto& kv : g_descriptors) {
+            DescriptorInfo& info = kv.second;
+            if (info.resource == res) {
+                info.state_known = true;
+                info.last_state = b.Transition.StateAfter;
+            }
+        }
+    }
+}
 void note_dx12_set_pipeline_state() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_pso_sets; }
 void note_dx12_set_graphics_root_descriptor_table() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_root_table_sets; }
 
@@ -182,11 +200,13 @@ void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_ha
     }
 }
 
-bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height) {
+bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height, D3D12_RESOURCE_STATES* out_state, bool* out_state_known) {
     if (out_resource) *out_resource = nullptr;
     if (out_format) *out_format = DXGI_FORMAT_UNKNOWN;
     if (out_width) *out_width = 0;
     if (out_height) *out_height = 0;
+    if (out_state) *out_state = D3D12_RESOURCE_STATE_COMMON;
+    if (out_state_known) *out_state_known = false;
     std::lock_guard<std::mutex> lk(g_mtx);
     ID3D12Resource* best = nullptr;
     DescriptorInfo best_info{};
@@ -206,6 +226,8 @@ bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORM
     if (out_format) *out_format = best_info.view_format != DXGI_FORMAT_UNKNOWN ? best_info.view_format : best_info.resource_format;
     if (out_width) *out_width = best_info.width;
     if (out_height) *out_height = best_info.height;
+    if (out_state) *out_state = best_info.last_state;
+    if (out_state_known) *out_state_known = best_info.state_known;
     return true;
 }
 

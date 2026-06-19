@@ -171,3 +171,7 @@ The DX12 scout now hooks command queues, command lists, RTV/DSV descriptor creat
 This build adds F6 as an experimental toggle to use the generic DX12 scout's best motion-vector-like render target candidate in the frame interpolation shader. Use F4/F5 as before, then press F6 to compare final-frame optical flow vs scout candidate motion.
 
 Suggested commit: `Use DX12 scout motion-vector candidates`
+
+### DX12 scout MV safety
+
+F6 scout-MV mode now uses a safe-copy path. Candidate motion-vector-like resources are copied into an injector-owned texture before sampling, instead of binding game-owned resources directly.

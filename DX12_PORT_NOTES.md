@@ -227,3 +227,9 @@ Expected logs:
 ```
 
 This is not a final UI design. The current hotkeys are temporary test controls and should later be replaced by a single proper clickable menu similar to upscaler replacement tools.
+
+## Scout MV candidate safety fix
+
+F6 no longer samples the scout-detected motion-vector candidate directly. The DX12 backend now tracks the candidate resource state from ResourceBarrier calls, copies the candidate into a private injector-owned texture when the state is known, then samples that private copy. This avoids crashes from sampling live game render targets/intermediate buffers in the wrong state.
+
+Suggested commit name: Fix DX12 scout MV candidate sampling crash

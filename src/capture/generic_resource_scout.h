@@ -53,7 +53,7 @@ void note_final_frame_motion(bool available);
 void note_dx12_command_list_seen();
 void note_dx12_execute_call(unsigned command_list_count);
 void note_dx12_draw_call(bool indexed);
-void note_dx12_resource_barrier(unsigned count);
+void note_dx12_resource_barrier(unsigned count, const D3D12_RESOURCE_BARRIER* barriers);
 void note_dx12_set_pipeline_state();
 void note_dx12_set_graphics_root_descriptor_table();
 void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc);
@@ -62,7 +62,7 @@ void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_ha
 
 // Returns AddRef'd resource for the current best motion/velocity-like candidate.
 // Caller must Release(). This is experimental and may be a false positive.
-bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height);
+bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height, D3D12_RESOURCE_STATES* out_state, bool* out_state_known);
 
 Snapshot snapshot();
 void log_snapshot_once();

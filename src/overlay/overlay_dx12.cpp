@@ -38,7 +38,7 @@ namespace {
     ID3D12Resource* g_lowres = nullptr;
     ID3D12Resource* g_history = nullptr;
     ID3D12Resource* g_generated = nullptr;
-    ID3D12Resource* g_scout_motion = nullptr;
+    ID3D12Resource* g_scout_motion = nullptr; // private safe copy of scout candidate, never the game-owned resource
     HANDLE g_fence_event = nullptr;
     UINT64 g_next_fence_value = 1;
     std::vector<FrameContext> g_frames;
@@ -938,32 +938,82 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     }
 
 
+    bool create_scout_motion_copy(ID3D12Resource* candidate, DXGI_FORMAT fmt, unsigned w, unsigned h) {
+        if (!candidate || !g_dev || !g_srv_heap || w == 0 || h == 0) return false;
+        if (g_scout_motion && g_scout_motion_width == w && g_scout_motion_height == h && g_scout_motion_format == fmt) return true;
+
+        safe_release(g_scout_motion);
+        g_scout_motion_width = 0;
+        g_scout_motion_height = 0;
+        g_scout_motion_format = DXGI_FORMAT_UNKNOWN;
+
+        D3D12_RESOURCE_DESC src_desc = candidate->GetDesc();
+        D3D12_RESOURCE_DESC copy_desc = src_desc;
+        copy_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        copy_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        copy_desc.SampleDesc.Count = 1;
+        copy_desc.SampleDesc.Quality = 0;
+
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        HRESULT hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &copy_desc,
+                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                    IID_PPV_ARGS(&g_scout_motion));
+        if (FAILED(hr) || !g_scout_motion) {
+            LOGF("[overlay-dx12] scout MV safe-copy texture create failed hr=0x%08lX %ux%u fmt=%u", hr, w, h, (unsigned)fmt);
+            return false;
+        }
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC mv_view{};
+        mv_view.Format = fmt;
+        mv_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        mv_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        mv_view.Texture2D.MipLevels = 1;
+        mv_view.Texture2D.MostDetailedMip = 0;
+        mv_view.Texture2D.PlaneSlice = 0;
+        mv_view.Texture2D.ResourceMinLODClamp = 0.0f;
+        g_dev->CreateShaderResourceView(g_scout_motion, &mv_view, srv_cpu(3));
+        g_scout_motion_width = w;
+        g_scout_motion_height = h;
+        g_scout_motion_format = fmt;
+        LOGF("[overlay-dx12] scout MV safe-copy texture created %ux%u fmt=%u", w, h, (unsigned)fmt);
+        return true;
+    }
+
     void update_scout_motion_binding() {
         g_scout_motion_bound = false;
-        if (!g_scout_motion_enabled || !g_dev || !g_srv_heap) return;
+        if (!g_scout_motion_enabled || !g_dev || !g_srv_heap || !g_cmd) return;
+
         ID3D12Resource* candidate = nullptr;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
         unsigned w = 0, h = 0;
-        if (!capture::scout::acquire_dx12_best_motion_candidate(&candidate, &fmt, &w, &h) || !candidate) return;
-        if (candidate != g_scout_motion) {
-            safe_release(g_scout_motion);
-            g_scout_motion = candidate;
-            g_scout_motion_format = fmt;
-            g_scout_motion_width = w;
-            g_scout_motion_height = h;
-            D3D12_SHADER_RESOURCE_VIEW_DESC mv_view{};
-            mv_view.Format = fmt;
-            mv_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            mv_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            mv_view.Texture2D.MipLevels = 1;
-            mv_view.Texture2D.MostDetailedMip = 0;
-            mv_view.Texture2D.PlaneSlice = 0;
-            mv_view.Texture2D.ResourceMinLODClamp = 0.0f;
-            g_dev->CreateShaderResourceView(g_scout_motion, &mv_view, srv_cpu(3));
-            LOGF("[overlay-dx12] scout MV candidate bound %ux%u fmt=%u", w, h, (unsigned)fmt);
-        } else {
+        D3D12_RESOURCE_STATES candidate_state = D3D12_RESOURCE_STATE_COMMON;
+        bool state_known = false;
+        if (!capture::scout::acquire_dx12_best_motion_candidate(&candidate, &fmt, &w, &h, &candidate_state, &state_known) || !candidate) return;
+
+        if (!state_known) {
+            static bool logged_unknown = false;
+            if (!logged_unknown) {
+                LOGF("[overlay-dx12] scout MV candidate found %ux%u fmt=%u but skipped: resource state unknown", w, h, (unsigned)fmt);
+                logged_unknown = true;
+            }
             candidate->Release();
+            return;
         }
+
+        if (!create_scout_motion_copy(candidate, fmt, w, h)) {
+            candidate->Release();
+            return;
+        }
+
+        // Copy into our own texture before sampling. Directly sampling the game-owned candidate crashed
+        // because it may still be in an RTV/UAV/intermediate state or be rewritten by the game.
+        transition(g_cmd, candidate, candidate_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(g_cmd, g_scout_motion, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        g_cmd->CopyResource(g_scout_motion, candidate);
+        transition(g_cmd, g_scout_motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        transition(g_cmd, candidate, D3D12_RESOURCE_STATE_COPY_SOURCE, candidate_state);
+        candidate->Release();
         g_scout_motion_bound = true;
     }
 
