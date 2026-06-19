@@ -95,22 +95,30 @@ namespace {
         if (ImGui::SliderFloat("Sharpness", &sharp, 0.0f, 1.0f)) cfg.sharpness.store(sharp);
 
         ImGui::Separator();
+        ImGui::Text("DX11 Frame Generation");
         bool fg = cfg.framegen_enabled.load();
         if (ImGui::Checkbox("Enable frame generation", &fg)) cfg.framegen_enabled.store(fg);
+        bool pacing = cfg.dx11_frame_pacing.load();
+        if (ImGui::Checkbox("Generated-frame pacing", &pacing)) cfg.dx11_frame_pacing.store(pacing);
+        bool overlayCapture = cfg.dx11_overlay_in_generated.load();
+        if (ImGui::Checkbox("Keep menu visible on generated frames", &overlayCapture))
+            cfg.dx11_overlay_in_generated.store(overlayCapture);
         if (g_profile.profile == detect::GameProfile::Bare)
-            ImGui::TextDisabled("(bare game: D3D11 optical flow)");
+            ImGui::TextDisabled("DX11 path: pyramid optical flow + confidence mask");
 
         ImGui::Text("Real frames:      %llu", (unsigned long long)framegen::real_frames());
         ImGui::Text("Generated frames: %llu", (unsigned long long)framegen::generated_frames());
 
         ImGui::Separator();
+        ImGui::Text("DX11 Depth Assist");
         if (depth::found())
             ImGui::Text("Depth buffer: %ux%u %s %s", depth::width(), depth::height(),
-                        depth::fmt_name(), depth::readable() ? "(readable)" : "(NOT readable)");
+                        depth::fmt_name(), depth::readable() ? "private copy OK" : "private copy pending");
         else
             ImGui::TextDisabled("Depth buffer: not detected yet");
         bool ud = cfg.use_depth.load();
         if (ImGui::Checkbox("Use depth for disocclusion", &ud)) cfg.use_depth.store(ud);
+        ImGui::TextDisabled("If the game DSV has no SRV bind, the injector tries a private copy.");
 
         ImGui::Separator();
         ImGui::TextDisabled("FSR engine: %s", fsr::status_string());

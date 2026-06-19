@@ -244,11 +244,17 @@ The scout motion-vector candidate path is now staged to avoid crashing immediate
 
 This separates candidate discovery, texture creation, copy/barrier validation, and shader sampling so failures can be isolated more safely.
 
-## DX11 parity update
+## DX11 parity patch notes
 
-The DX11 frame-generation path now mirrors two important DX12-side improvements:
+This build updates the DX11 path after NieR testing:
 
-- The old single-pass block matcher has been replaced with a coarse-to-fine / pyramid-style optical-flow estimator. It searches wide motion first and then refines around that result, matching the DX12 FSR3-lite motion path more closely.
-- Generated-frame presentation now happens after the real Present with midpoint-style pacing. This reduces the bursty `generated immediately before real frame` behavior from the previous DX11 path.
+- DX11 overlay is now drawn before the frame-generation capture by default. Generated frames inherit the menu, which avoids the old alternating-frame menu flicker.
+- DX11 depth detection now creates a private SRV-readable depth copy when the game depth buffer is DSV-only. This is intended for titles that log `found but NOT readable (no SRV bind)`.
+- The DX11 menu now exposes generated-frame pacing and the menu-in-generated-frame behavior as runtime toggles.
 
-This is still final-frame optical flow, not engine motion vectors, but it brings DX11 closer to the current DX12 experimental framegen quality path.
+Environment overrides:
+
+```bat
+set FSRINJ_DX11_PACING=0
+set FSRINJ_DX11_MENU_IN_GEN=0
+```

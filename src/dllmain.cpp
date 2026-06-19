@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <thread>
+#include <cstdlib>
 
 #include "proxy/dxgi_proxy.h"
 #include "hooks/swapchain_hook.h"
@@ -10,7 +11,19 @@
 #include "core/log.h"
 
 namespace core {
-    Config& config() { static Config c; return c; }
+    Config& config() {
+        static Config c;
+        static bool loaded_env = false;
+        if (!loaded_env) {
+            loaded_env = true;
+            wchar_t v[16]{};
+            if (GetEnvironmentVariableW(L"FSRINJ_DX11_PACING", v, 16) > 0)
+                c.dx11_frame_pacing.store(_wtoi(v) != 0);
+            if (GetEnvironmentVariableW(L"FSRINJ_DX11_MENU_IN_GEN", v, 16) > 0)
+                c.dx11_overlay_in_generated.store(_wtoi(v) != 0);
+        }
+        return c;
+    }
 }
 
 static std::wstring dll_directory(HMODULE self) {

@@ -16,6 +16,8 @@ struct Config {
     std::atomic<bool>  framegen_enabled{false};
     std::atomic<int>   framegen_multiplier{2}; // 2 = interpolate one frame
     std::atomic<bool>  use_depth{false}; // depth-assisted disocclusion (default off)
+    std::atomic<bool>  dx11_frame_pacing{true}; // Present generated frames on the midpoint path
+    std::atomic<bool>  dx11_overlay_in_generated{true}; // draw overlay before DX11 FG capture to avoid flicker
 
     std::atomic<int>   toggle_key{0x24}; // VK_HOME
 };

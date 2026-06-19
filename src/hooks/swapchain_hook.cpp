@@ -33,32 +33,44 @@ static bool is_d3d11_swapchain(IDXGISwapChain* sc) {
 
 // Classic present path (DISCARD / older games).
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) {
-    if (is_d3d11_swapchain(sc)) {
-        framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+    const bool d3d11 = is_d3d11_swapchain(sc);
+    if (d3d11) {
         upscaler::sharpen(sc);
+        if (core::config().dx11_overlay_in_generated.load()) {
+            // Render UI before framegen capture so generated frames also carry the menu.
+            // This avoids the alternating-menu flicker seen in DX11 titles.
+            overlay::on_present(sc);
+            framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+        } else {
+            framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+            overlay::on_present(sc);
+        }
+    } else {
+        overlay::on_present(sc);
     }
-    overlay::on_present(sc);
     HRESULT hr = g_orig_present(sc, sync, flags);
-    if (SUCCEEDED(hr)) {
-        if (is_d3d11_swapchain(sc)) framegen::after_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
-        overlay::after_present(sc, flags, g_orig_present);
-    }
+    if (SUCCEEDED(hr)) overlay::after_present(sc, flags, g_orig_present);
     return hr;
 }
 
 // Flip-model present path (most modern D3D11 games).
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                              const DXGI_PRESENT_PARAMETERS* pp) {
-    if (is_d3d11_swapchain(sc)) {
-        framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+    const bool d3d11 = is_d3d11_swapchain(sc);
+    if (d3d11) {
         upscaler::sharpen(sc);
+        if (core::config().dx11_overlay_in_generated.load()) {
+            overlay::on_present(sc);
+            framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+        } else {
+            framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+            overlay::on_present(sc);
+        }
+    } else {
+        overlay::on_present(sc);
     }
-    overlay::on_present(sc);
     HRESULT hr = g_orig_present1(sc, sync, flags, pp);
-    if (SUCCEEDED(hr)) {
-        if (is_d3d11_swapchain(sc)) framegen::after_present(reinterpret_cast<IDXGISwapChain*>(sc), reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
-        overlay::after_present1(sc, flags, pp, g_orig_present1);
-    }
+    if (SUCCEEDED(hr)) overlay::after_present1(sc, flags, pp, g_orig_present1);
     return hr;
 }
 
