@@ -100,3 +100,13 @@ The scout path is still heuristic. It should be treated as a discovery/debugging
 ## Building
 
 Use GitHub Actions on a Windows runner. The repo includes workflow files under `.github/workflows/`. After the build completes, download the `dxgi.dll` artifact and place it next to the target game executable.
+
+## Current Experimental Scout-MV Test Flow
+
+The DX12 scout-MV path is intentionally staged:
+
+1. Press `F6` to enable scout motion-vector validation. This only discovers a candidate and creates a private copy texture.
+2. Press `F7` once to validate copying the candidate into the private texture.
+3. Press `F7` again to actually use the copied motion-vector candidate in the shader.
+
+If the game crashes after a specific stage, the last log line identifies whether the issue is candidate creation, copy/barrier validation, or shader sampling.

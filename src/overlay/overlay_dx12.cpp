@@ -59,8 +59,12 @@ namespace {
     bool g_interpolation_enabled = false;
     bool g_generated_present_enabled = false;
     bool g_generated_ready = false;
-    bool g_scout_motion_enabled = false;
-    bool g_scout_motion_bound = false;
+    bool g_scout_motion_enabled = false;        // F6: scout candidate validation enabled
+    bool g_scout_motion_bound = false;          // true only when the copied MV texture is actively used by shader
+    bool g_scout_motion_copy_ready = false;     // private copy exists and copy commands have been recorded successfully
+    bool g_scout_motion_use_enabled = false;    // F7 second press: actually feed copied MV into interpolation/framegen
+    bool g_scout_motion_copy_requested = false; // F7 first press: record a copy validation command
+    bool g_scout_motion_create_only_logged = false;
     bool g_prev_left_mouse = false;
     bool g_inside_generated_present = false;
     LARGE_INTEGER g_qpc_freq{};
@@ -761,6 +765,10 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         safe_release(g_generated);
         safe_release(g_scout_motion);
         g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_scout_motion_bound = false;
+        g_scout_motion_copy_ready = false;
+        g_scout_motion_create_only_logged = false;
+        g_scout_motion_copy_requested = false;
         safe_release(g_srv_heap);
         safe_release(g_downscale_pso);
         safe_release(g_easu_rcas_pso);
@@ -870,6 +878,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_interpolation_enabled = !env_disabled(L"FSRINJ_DX12_INTERP") && env_float(L"FSRINJ_DX12_INTERP", 0.0f) > 0.5f;
         g_generated_present_enabled = !env_disabled(L"FSRINJ_DX12_GENPRESENT") && env_float(L"FSRINJ_DX12_GENPRESENT", 0.0f) > 0.5f;
         g_scout_motion_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV") && env_float(L"FSRINJ_DX12_SCOUT_MV", 0.0f) > 0.5f;
+        g_scout_motion_use_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV_USE") && env_float(L"FSRINJ_DX12_SCOUT_MV_USE", 0.0f) > 0.5f;
 
         hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         if (FAILED(hr)) {
@@ -891,7 +900,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         LOGF("[overlay-dx12] FSR1-style EASU/RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off");
-        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present F6=scout-MV; mouse clicks supported");
+        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present F6=scout-MV validate F7=scout-MV use; mouse clicks supported");
         return true;
     }
 
@@ -1026,32 +1035,57 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             return;
         }
 
+        const bool already_had_copy = (g_scout_motion && g_scout_motion_width == w && g_scout_motion_height == h && g_scout_motion_format == fmt);
         if (!create_scout_motion_copy(candidate, fmt, w, h)) {
             candidate->Release();
             return;
         }
 
-        // Copy into our own texture before sampling. Directly sampling the game-owned candidate crashed
-        // because it may still be in an RTV/UAV/intermediate state or be rewritten by the game.
-        transition(g_cmd, candidate, candidate_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        if (g_scout_motion_state != D3D12_RESOURCE_STATE_COPY_DEST) {
-            transition(g_cmd, g_scout_motion, g_scout_motion_state, D3D12_RESOURCE_STATE_COPY_DEST);
-            g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        // Stage 1: F6 only validates candidate discovery and private texture creation.
+        // Do not copy from, transition, or sample the game-owned resource yet. The previous
+        // build crashed immediately after creation, so this separates creation from copy/use.
+        if (!g_scout_motion_copy_requested && !g_scout_motion_copy_ready) {
+            if (!already_had_copy && !g_scout_motion_create_only_logged) {
+                LOGF("[overlay-dx12] scout MV stage1 create-only OK; press F7 to record copy validation");
+                g_scout_motion_create_only_logged = true;
+            }
+            candidate->Release();
+            return;
         }
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = g_scout_motion;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        dst.SubresourceIndex = 0;
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource = candidate;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = 0;
-        g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        transition(g_cmd, g_scout_motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        g_scout_motion_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        transition(g_cmd, candidate, D3D12_RESOURCE_STATE_COPY_SOURCE, candidate_state);
+
+        // Stage 2: copy validation only. Still do not bind the copied texture to the shader
+        // unless F7 is pressed again after copy_ready becomes true.
+        if (g_scout_motion_copy_requested && !g_scout_motion_copy_ready) {
+            LOGF("[overlay-dx12] scout MV stage2 copy validation begin %ux%u fmt=%u srcState=0x%X",
+                 w, h, (unsigned)fmt, (unsigned)candidate_state);
+            transition(g_cmd, candidate, candidate_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            if (g_scout_motion_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+                transition(g_cmd, g_scout_motion, g_scout_motion_state, D3D12_RESOURCE_STATE_COPY_DEST);
+                g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            }
+            D3D12_TEXTURE_COPY_LOCATION dst{};
+            dst.pResource = g_scout_motion;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION src{};
+            src.pResource = candidate;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            transition(g_cmd, g_scout_motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            g_scout_motion_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            transition(g_cmd, candidate, D3D12_RESOURCE_STATE_COPY_SOURCE, candidate_state);
+            g_scout_motion_copy_ready = true;
+            g_scout_motion_copy_requested = false;
+            LOGF("[overlay-dx12] scout MV stage2 copy validation commands recorded; press F7 again to use copied MV");
+            candidate->Release();
+            return;
+        }
+
         candidate->Release();
-        g_scout_motion_bound = true;
+        if (g_scout_motion_use_enabled && g_scout_motion_copy_ready) {
+            g_scout_motion_bound = true;
+        }
     }
 
     bool render_upscale(FrameContext& f) {
@@ -1075,7 +1109,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             bind_fullscreen_state(g_lowres_rtv, g_low_width, g_low_height, g_downscale_pso,
                                   1.0f / static_cast<float>(g_width), 1.0f / static_cast<float>(g_height),
                                   g_sharpness, g_scale, false, true, g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps, (g_scout_motion_enabled && g_scout_motion_bound) ? 1.0f : 0.0f, 0.0f, g_scout_motion_bound ? 1.0f : 0.0f);
+                                  g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
             transition(g_cmd, g_lowres, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             g_lowres_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
             final_inv_x = 1.0f / static_cast<float>(g_low_width);
@@ -1089,7 +1123,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                   final_inv_x, final_inv_y,
                                   g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
                                   g_history_ready, true, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps, (g_scout_motion_enabled && g_scout_motion_bound) ? 1.0f : 0.0f, 0.0f, g_scout_motion_bound ? 1.0f : 0.0f);
+                                  g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
             transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_generated_ready = true;
@@ -1102,7 +1136,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                               final_inv_x, final_inv_y,
                               g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
                               g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                              g_real_fps, g_output_fps, (g_scout_motion_enabled && g_scout_motion_bound) ? 1.0f : 0.0f, 0.0f, g_scout_motion_bound ? 1.0f : 0.0f);
+                              g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g_input_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         transition(g_cmd, g_history, g_history_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1243,7 +1277,35 @@ bool on_present(IDXGISwapChain* sc) {
     if (pressed(VK_F3)) { g_scale = 0.59f; g_sharpness = 0.55f; recreate_scale_resources = true; LOGF("[overlay-dx12] F3 preset: Performance scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
     if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
     if (pressed(VK_F5)) { g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0; LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
-    if (pressed(VK_F6)) { g_scout_motion_enabled = !g_scout_motion_enabled; g_generated_ready = false; LOGF("[overlay-dx12] F6: scout motion-vector candidate %s (bound=%s)", g_scout_motion_enabled ? "enabled" : "disabled", g_scout_motion_bound ? "yes" : "no"); }
+    if (pressed(VK_F6)) {
+        g_scout_motion_enabled = !g_scout_motion_enabled;
+        g_scout_motion_use_enabled = false;
+        g_scout_motion_copy_requested = false;
+        g_scout_motion_bound = false;
+        g_scout_motion_copy_ready = false;
+        g_scout_motion_create_only_logged = false;
+        safe_release(g_scout_motion);
+        g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_scout_motion_width = 0;
+        g_scout_motion_height = 0;
+        g_scout_motion_format = DXGI_FORMAT_UNKNOWN;
+        g_generated_ready = false;
+        LOGF("[overlay-dx12] F6: scout MV validation %s; stage1=create only, F7=copy/use", g_scout_motion_enabled ? "enabled" : "disabled");
+    }
+    if (pressed(VK_F7)) {
+        if (!g_scout_motion_enabled) {
+            LOGF("[overlay-dx12] F7 ignored: enable F6 scout MV validation first");
+        } else if (!g_scout_motion_copy_ready) {
+            g_scout_motion_copy_requested = true;
+            g_scout_motion_use_enabled = false;
+            g_scout_motion_bound = false;
+            LOGF("[overlay-dx12] F7: scout MV copy validation requested; shader use still disabled");
+        } else {
+            g_scout_motion_use_enabled = !g_scout_motion_use_enabled;
+            g_generated_ready = false;
+            LOGF("[overlay-dx12] F7: scout MV shader use %s (copy=ready)", g_scout_motion_use_enabled ? "enabled" : "disabled");
+        }
+    }
 
     handle_mouse_controls();
 

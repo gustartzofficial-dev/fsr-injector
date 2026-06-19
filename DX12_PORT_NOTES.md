@@ -233,3 +233,13 @@ This is not a final UI design. The current hotkeys are temporary test controls a
 F6 no longer samples the scout-detected motion-vector candidate directly. The DX12 backend now tracks the candidate resource state from ResourceBarrier calls, copies the candidate into a private injector-owned texture when the state is known, then samples that private copy. This avoids crashes from sampling live game render targets/intermediate buffers in the wrong state.
 
 Suggested commit name: Fix DX12 scout MV candidate sampling crash
+
+## Scout MV staged validation
+
+The scout motion-vector candidate path is now staged to avoid crashing immediately after a candidate is found.
+
+- F6 enables candidate validation and creates a private copy texture only.
+- F7 first press records copy-validation commands into the private texture, but does not feed it into the shader.
+- F7 after copy is ready toggles actual scout-MV shader usage.
+
+This separates candidate discovery, texture creation, copy/barrier validation, and shader sampling so failures can be isolated more safely.
