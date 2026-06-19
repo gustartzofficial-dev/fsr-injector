@@ -271,7 +271,8 @@ namespace {
             return false;
         }
 
-        const char* hlsl = R"HLSL(
+        const char* hlsl =
+R"HLSL(
 Texture2D<float4> gInput : register(t0);
 Texture2D<float4> gHistory : register(t1);
 Texture2D<float4> gLowres : register(t2);
@@ -475,7 +476,8 @@ float3 draw_native_ui(float3 color, float2 pos) {
     if (scoutMotion > 0.5) white = max(white, text_pixel(77,86,32,67,65,78,68,32,32,32,32,32, pos, o + float2(0, 234), 2.0)); // MV CAND
     else white = max(white, text_pixel(77,86,32,78,79,78,69,32,32,32,32,32, pos, o + float2(0, 234), 2.0)); // MV NONE
     if (scoutDepth > 0.5) white = max(white, text_pixel(68,69,80,84,72,32,89,69,83,32,32,32, pos, o + float2(0, 258), 2.0)); // DEPTH YES
-    else white = max(white, text_pixel(68,69,80,84,72,32,78,79,32,32,32,32, pos, o + float2(0, 258), 2.0)); // DEPTH NO
+)HLSL"
+R"HLSL(    else white = max(white, text_pixel(68,69,80,84,72,32,78,79,32,32,32,32, pos, o + float2(0, 258), 2.0)); // DEPTH NO
     color = lerp(color, float3(0.92, 0.92, 0.95), white);
 
     float scaleBg = step(98.0, pos.x) * step(72.0, pos.y) * step(pos.x, 226.0) * step(pos.y, 78.0);
@@ -575,8 +577,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     }
     color = draw_native_ui(color, i.pos.xy);
     return float4(color, base.a);
-}
-)HLSL";
+})HLSL";
 
         ID3DBlob* vs = nullptr;
         ID3DBlob* ps_down = nullptr;
