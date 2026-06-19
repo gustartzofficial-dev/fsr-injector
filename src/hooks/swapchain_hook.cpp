@@ -3,6 +3,7 @@
 #include "fsr/framegen.h"
 #include "fsr/upscaler.h"
 #include "core/log.h"
+#include "core/config.h"
 
 #include <windows.h>
 #include <d3d11.h>
