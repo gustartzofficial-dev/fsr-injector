@@ -69,6 +69,11 @@ namespace {
     bool g_inside_generated_present = false;
     LARGE_INTEGER g_qpc_freq{};
     LARGE_INTEGER g_fps_window_start{};
+    // --- frame pacing state ---
+    LARGE_INTEGER g_last_real_present_qpc{}; // timestamp of the most recent real present
+    double g_real_interval_sec = 0.0;        // smoothed gap between real presents (EMA)
+    bool   g_pacing_enabled = true;          // space generated frame toward the temporal midpoint
+    double g_pace_fraction = 0.5;            // 0.5 = halfway between two real frames
     unsigned g_real_present_samples = 0;
     unsigned g_generated_present_samples = 0;
     unsigned g_generated_present_log_count = 0;
@@ -516,39 +521,81 @@ R"HLSL(    else white = max(white, text_pixel(68,69,80,84,72,32,78,79,32,32,32,3
 }
 
 
-float patch_error(float2 prevUv, float2 currUv) {
-    float2 px = invOutputSize;
+float patch_error_lvl(float2 prevUv, float2 currUv, float2 spread) {
+    // Compares a small cross of taps. 'spread' widens the taps to emulate a coarser
+    // pyramid level: large spread = blurry/low-detail comparison (captures big motion),
+    // small spread = sharp comparison (locks fine detail).
     float e = 0.0;
-    float3 p0 = gHistory.SampleLevel(gSampler, prevUv, 0.0).rgb;
-    float3 c0 = gInput.SampleLevel(gSampler, currUv, 0.0).rgb;
-    e += abs(luma(p0) - luma(c0)) * 2.0;
-    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2( px.x, 0.0), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2( px.x, 0.0), 0.0).rgb));
-    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(-px.x, 0.0), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(-px.x, 0.0), 0.0).rgb));
-    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(0.0,  px.y), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(0.0,  px.y), 0.0).rgb));
-    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(0.0, -px.y), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(0.0, -px.y), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv, 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv, 0.0).rgb)) * 2.0;
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2( spread.x, 0.0), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2( spread.x, 0.0), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(-spread.x, 0.0), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(-spread.x, 0.0), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(0.0,  spread.y), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(0.0,  spread.y), 0.0).rgb));
+    e += abs(luma(gHistory.SampleLevel(gSampler, prevUv + float2(0.0, -spread.y), 0.0).rgb) - luma(gInput.SampleLevel(gSampler, currUv + float2(0.0, -spread.y), 0.0).rgb));
     return e;
 }
 
 float2 estimate_optical_flow_lite(float2 uv, out float confidence) {
-    // Final-frame-only optical-flow-lite. This is not game motion vectors; it is a
-    // small block/patch search over previous/current backbuffers, similar in spirit
-    // to optical-flow estimation but cheap enough for the injector prototype.
+    // Coarse-to-fine ("pyramid") optical flow over the final backbuffers only. We have
+    // no real mip chain here, so each level emulates a shrunk copy by widening the
+    // compare taps (spread) and the search step. Level 0 reaches far but rough; each
+    // later level refines around the previous estimate. This captures large motion
+    // (fast pans / low fps) that the old fixed +-6px single search could not see,
+    // while keeping every individual search small. Still NOT engine motion vectors.
     float2 px = invOutputSize;
+    float2 flow = float2(0.0, 0.0);
     float best = 9999.0;
     float second = 9999.0;
-    float2 bestOff = float2(0.0, 0.0);
-    [unroll] for (int y = -3; y <= 3; ++y) {
-        [unroll] for (int x = -3; x <= 3; ++x) {
-            float2 off = float2((float)x, (float)y) * px * 2.0;
-            float err = patch_error(uv, uv + off);
-            if (err < best) { second = best; best = err; bestOff = off; }
-            else if (err < second) second = err;
+
+    // Level 0 -- coarse: 5x5 search, wide step (~+-14px reach), blurry compare.
+    {
+        float2 s = px * 7.0;   // step between candidates
+        float2 b = px * 5.0;   // compare spread (coarse detail)
+        float2 cBest = flow; best = 9999.0; second = 9999.0;
+        [unroll] for (int y = -2; y <= 2; ++y) {
+            [unroll] for (int x = -2; x <= 2; ++x) {
+                float2 cand = flow + float2((float)x, (float)y) * s;
+                float err = patch_error_lvl(uv, uv + cand, b);
+                if (err < best) { second = best; best = err; cBest = cand; }
+                else if (err < second) second = err;
+            }
         }
+        flow = cBest;
     }
+    // Level 1 -- medium: 3x3 search around the coarse guess.
+    {
+        float2 s = px * 3.0;
+        float2 b = px * 2.0;
+        float2 cBest = flow; best = 9999.0; second = 9999.0;
+        [unroll] for (int y = -1; y <= 1; ++y) {
+            [unroll] for (int x = -1; x <= 1; ++x) {
+                float2 cand = flow + float2((float)x, (float)y) * s;
+                float err = patch_error_lvl(uv, uv + cand, b);
+                if (err < best) { second = best; best = err; cBest = cand; }
+                else if (err < second) second = err;
+            }
+        }
+        flow = cBest;
+    }
+    // Level 2 -- fine: 3x3 single-pixel refine, sharp compare.
+    {
+        float2 s = px * 1.0;
+        float2 b = px * 1.0;
+        float2 cBest = flow; best = 9999.0; second = 9999.0;
+        [unroll] for (int y = -1; y <= 1; ++y) {
+            [unroll] for (int x = -1; x <= 1; ++x) {
+                float2 cand = flow + float2((float)x, (float)y) * s;
+                float err = patch_error_lvl(uv, uv + cand, b);
+                if (err < best) { second = best; best = err; cBest = cand; }
+                else if (err < second) second = err;
+            }
+        }
+        flow = cBest;
+    }
+
     float ambiguity = saturate((second - best) * 4.0);
     float quality = 1.0 - saturate(best * 1.6);
     confidence = saturate(quality * (0.35 + 0.65 * ambiguity));
-    return bestOff;
+    return flow;
 }
 
 float2 scout_motion_vector(float2 uv, out float mvConfidence) {
@@ -900,6 +947,12 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_generated_present_enabled = !env_disabled(L"FSRINJ_DX12_GENPRESENT") && env_float(L"FSRINJ_DX12_GENPRESENT", 0.0f) > 0.5f;
         g_scout_motion_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV") && env_float(L"FSRINJ_DX12_SCOUT_MV", 0.0f) > 0.5f;
         g_scout_motion_use_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV_USE") && env_float(L"FSRINJ_DX12_SCOUT_MV_USE", 0.0f) > 0.5f;
+        g_pacing_enabled = !env_disabled(L"FSRINJ_DX12_PACING");
+        g_pace_fraction = (double)env_float(L"FSRINJ_DX12_PACE_FRACTION", 0.5f);
+        if (g_pace_fraction < 0.1) g_pace_fraction = 0.1;
+        if (g_pace_fraction > 0.9) g_pace_fraction = 0.9;
+        g_last_real_present_qpc = LARGE_INTEGER{};
+        g_real_interval_sec = 0.0;
 
         hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         if (FAILED(hr)) {
@@ -1444,10 +1497,52 @@ namespace {
         g_generated_ready = false;
         return true;
     }
+
+    // Record when each real frame was presented and keep a smoothed estimate of the
+    // gap between real presents. Implausible gaps (alt-tab, hitches, first frame) are
+    // ignored so one stutter doesn't poison the average.
+    void note_real_present_timing() {
+        if (g_qpc_freq.QuadPart == 0) QueryPerformanceFrequency(&g_qpc_freq);
+        if (g_qpc_freq.QuadPart == 0) return;
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        if (g_last_real_present_qpc.QuadPart != 0) {
+            double dt = double(now.QuadPart - g_last_real_present_qpc.QuadPart) / double(g_qpc_freq.QuadPart);
+            if (dt > 0.0005 && dt < 0.2) {  // 5000fps..5fps window
+                if (g_real_interval_sec <= 0.0) g_real_interval_sec = dt;
+                else g_real_interval_sec = g_real_interval_sec * 0.9 + dt * 0.1;
+            }
+        }
+        g_last_real_present_qpc = now;
+    }
+
+    // Hold the generated frame back so it lands ~halfway (in time) between the two real
+    // frames instead of right on top of the previous one. Without this, doubling the
+    // present count still judders because frames arrive in bursts. Capped so a hitch
+    // can never stall the game thread for long. This costs up to ~half a frame of
+    // latency on the generated frame; a dedicated present thread would remove that.
+    void pace_generated_present() {
+        if (!g_pacing_enabled || g_real_interval_sec <= 0.0 || g_qpc_freq.QuadPart == 0) return;
+        double target = g_pace_fraction * g_real_interval_sec;
+        double cap = g_real_interval_sec * 0.9;
+        if (target > cap) target = cap;
+        if (target <= 0.0) return;
+        LARGE_INTEGER now{};
+        int guard = 0;
+        for (;;) {
+            QueryPerformanceCounter(&now);
+            double elapsed = double(now.QuadPart - g_last_real_present_qpc.QuadPart) / double(g_qpc_freq.QuadPart);
+            if (elapsed >= target || ++guard > 2000000) break;
+            if (target - elapsed > 0.0015) Sleep(0); // yield while far from target
+            else YieldProcessor();                   // tight spin near the target
+        }
+    }
 }
 
 void after_present(IDXGISwapChain* sc, unsigned int flags, PresentFn present_fn) {
+    note_real_present_timing();
     if (!present_fn || !submit_generated_to_current_backbuffer(sc)) return;
+    pace_generated_present();
     g_inside_generated_present = true;
     HRESULT hr = present_fn(sc, 0, flags);
     g_inside_generated_present = false;
@@ -1460,7 +1555,9 @@ void after_present(IDXGISwapChain* sc, unsigned int flags, PresentFn present_fn)
 }
 
 void after_present1(IDXGISwapChain1* sc, unsigned int flags, const DXGI_PRESENT_PARAMETERS* pp, Present1Fn present1_fn) {
+    note_real_present_timing();
     if (!present1_fn || !submit_generated_to_current_backbuffer(reinterpret_cast<IDXGISwapChain*>(sc))) return;
+    pace_generated_present();
     g_inside_generated_present = true;
     DXGI_PRESENT_PARAMETERS empty{};
     const DXGI_PRESENT_PARAMETERS* use_pp = pp ? pp : &empty;
@@ -1487,6 +1584,8 @@ void shutdown() {
     g_effect_enabled = true;
     g_menu_visible = true;
     g_logged_first_effect = false;
+    g_last_real_present_qpc = LARGE_INTEGER{};
+    g_real_interval_sec = 0.0;
     g_history_ready = false;
     g_interpolation_enabled = false;
     g_generated_present_enabled = false;
