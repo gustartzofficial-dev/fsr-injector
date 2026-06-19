@@ -39,6 +39,7 @@ namespace {
     ID3D12Resource* g_history = nullptr;
     ID3D12Resource* g_generated = nullptr;
     ID3D12Resource* g_scout_motion = nullptr; // private safe copy of scout candidate, never the game-owned resource
+    D3D12_RESOURCE_STATES g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
     HANDLE g_fence_event = nullptr;
     UINT64 g_next_fence_value = 1;
     std::vector<FrameContext> g_frames;
@@ -759,6 +760,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         safe_release(g_history);
         safe_release(g_generated);
         safe_release(g_scout_motion);
+        g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
         safe_release(g_srv_heap);
         safe_release(g_downscale_pso);
         safe_release(g_easu_rcas_pso);
@@ -946,23 +948,46 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_scout_motion_width = 0;
         g_scout_motion_height = 0;
         g_scout_motion_format = DXGI_FORMAT_UNKNOWN;
+        g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
+        // Do not clone the game's resource desc blindly. Some engines create velocity-like
+        // buffers with flags/layout/mip/array properties that are invalid for our private
+        // committed copy. Create a clean SRV-compatible 2D texture and copy only subresource 0.
         D3D12_RESOURCE_DESC src_desc = candidate->GetDesc();
-        D3D12_RESOURCE_DESC copy_desc = src_desc;
-        copy_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        copy_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_RESOURCE_DESC copy_desc{};
+        copy_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        copy_desc.Alignment = 0;
+        copy_desc.Width = w ? w : static_cast<UINT>(src_desc.Width);
+        copy_desc.Height = h ? h : src_desc.Height;
+        copy_desc.DepthOrArraySize = 1;
+        copy_desc.MipLevels = 1;
+        copy_desc.Format = fmt == DXGI_FORMAT_UNKNOWN ? src_desc.Format : fmt;
         copy_desc.SampleDesc.Count = 1;
         copy_desc.SampleDesc.Quality = 0;
+        copy_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        copy_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
         HRESULT hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &copy_desc,
-                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                     IID_PPV_ARGS(&g_scout_motion));
         if (FAILED(hr) || !g_scout_motion) {
-            LOGF("[overlay-dx12] scout MV safe-copy texture create failed hr=0x%08lX %ux%u fmt=%u", hr, w, h, (unsigned)fmt);
+            static HRESULT last_hr = S_OK;
+            static unsigned fail_count = 0;
+            fail_count++;
+            if (hr != last_hr || fail_count <= 3 || (fail_count % 120) == 0) {
+                LOGF("[overlay-dx12] scout MV safe-copy texture create failed hr=0x%08lX %ux%u fmt=%u srcDim=%u srcMip=%u srcArray=%u srcFlags=0x%X",
+                     hr, w, h, (unsigned)fmt, (unsigned)src_desc.Dimension, (unsigned)src_desc.MipLevels, (unsigned)src_desc.DepthOrArraySize, (unsigned)src_desc.Flags);
+                last_hr = hr;
+            }
             return false;
         }
+        g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
 
         D3D12_SHADER_RESOURCE_VIEW_DESC mv_view{};
         mv_view.Format = fmt;
@@ -1009,9 +1034,21 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         // Copy into our own texture before sampling. Directly sampling the game-owned candidate crashed
         // because it may still be in an RTV/UAV/intermediate state or be rewritten by the game.
         transition(g_cmd, candidate, candidate_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        transition(g_cmd, g_scout_motion, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
-        g_cmd->CopyResource(g_scout_motion, candidate);
+        if (g_scout_motion_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            transition(g_cmd, g_scout_motion, g_scout_motion_state, D3D12_RESOURCE_STATE_COPY_DEST);
+            g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = g_scout_motion;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = candidate;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        g_cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         transition(g_cmd, g_scout_motion, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        g_scout_motion_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         transition(g_cmd, candidate, D3D12_RESOURCE_STATE_COPY_SOURCE, candidate_state);
         candidate->Release();
         g_scout_motion_bound = true;
