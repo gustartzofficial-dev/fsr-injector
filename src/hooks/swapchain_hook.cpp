@@ -39,7 +39,10 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT 
     }
     overlay::on_present(sc);
     HRESULT hr = g_orig_present(sc, sync, flags);
-    if (SUCCEEDED(hr)) overlay::after_present(sc, flags, g_orig_present);
+    if (SUCCEEDED(hr)) {
+        if (is_d3d11_swapchain(sc)) framegen::after_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+        overlay::after_present(sc, flags, g_orig_present);
+    }
     return hr;
 }
 
@@ -52,7 +55,10 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UIN
     }
     overlay::on_present(sc);
     HRESULT hr = g_orig_present1(sc, sync, flags, pp);
-    if (SUCCEEDED(hr)) overlay::after_present1(sc, flags, pp, g_orig_present1);
+    if (SUCCEEDED(hr)) {
+        if (is_d3d11_swapchain(sc)) framegen::after_present(reinterpret_cast<IDXGISwapChain*>(sc), reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+        overlay::after_present1(sc, flags, pp, g_orig_present1);
+    }
     return hr;
 }
 

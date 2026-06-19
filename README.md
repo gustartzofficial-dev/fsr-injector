@@ -23,7 +23,9 @@ This project is currently experimental. It is not a production-quality FSR3 repl
 ### Working DX11 features
 
 - Existing DX11 overlay/path remains supported.
-- Existing DX11 sharpening/framegen fallback path remains supported.
+- Existing DX11 sharpening path remains supported.
+- DX11 framegen now uses the newer pyramid/coarse-to-fine optical-flow estimator ported from the DX12 path.
+- DX11 generated frames are now staged and presented after the real frame with midpoint-style pacing instead of being injected in a burst before the real Present.
 - Initial DX11 scout parity hooks are present for depth/render-resource diagnostics.
 
 ### Experimental / unstable features
@@ -46,6 +48,8 @@ Current test controls are temporary and will eventually be replaced by a proper 
 - `F5` = experimental generated-frame presentation.
 - `F6` = experimental scout motion-vector candidate usage.
 
+DX11 framegen currently uses the global config toggle exposed by the DX11 menu/path. The new pacing can be disabled for testing with `FSRINJ_DX11_PACING=0`.
+
 ## Runtime environment options
 
 - `FSRINJ_DX12_SHARPEN=0` disables the DX12 post-process path.
@@ -53,6 +57,7 @@ Current test controls are temporary and will eventually be replaced by a proper 
 - `FSRINJ_DX12_SCALE=<value>` sets startup internal scale.
 - `FSRINJ_DX12_GENPRESENT=1` enables experimental generated-frame presentation at startup.
 - `FSRINJ_DX12_SCOUT_MV=1` enables experimental scout motion-vector candidate usage at startup.
+- `FSRINJ_DX11_PACING=0` disables the new paced DX11 generated-present path for comparison testing.
 
 ## What this project can do now
 
@@ -92,7 +97,7 @@ The scout path is still heuristic. It should be treated as a discovery/debugging
 2. Add better candidate ranking and rejection.
 3. Add depth candidate copying/visualization.
 4. Feed validated depth/motion data into interpolation.
-5. Improve generated-frame pacing and quality.
+5. Continue improving generated-frame pacing and quality on both DX12 and DX11.
 6. Replace temporary hotkeys with a proper clickable menu.
 7. Investigate optional game/engine companion modules for higher-quality data when available.
 8. Investigate deeper FidelityFX SDK / FSR3 integration once required inputs and pacing are stable.

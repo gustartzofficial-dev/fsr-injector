@@ -31,6 +31,17 @@ namespace {
 
     ID3D11Texture2D* g_prev_tex=nullptr; ID3D11ShaderResourceView* g_prev_srv=nullptr;
     ID3D11Texture2D* g_curr_tex=nullptr; ID3D11ShaderResourceView* g_curr_srv=nullptr;
+    ID3D11Texture2D* g_gen_tex=nullptr; ID3D11RenderTargetView* g_gen_rtv=nullptr;
+    bool g_generated_ready=false;
+
+    LARGE_INTEGER g_qpc_freq{};
+    LARGE_INTEGER g_last_real_present{};
+    double g_real_interval_sec=0.0;
+    bool g_have_real_timing=false;
+    bool g_inside_generated_present=false;
+    bool g_pacing_enabled=true;
+    float g_pace_fraction=0.50f;
+
     // two low-res RGBA16F flow buffers (xy = px offset, z = confidence): raw + smoothed
     ID3D11Texture2D* g_flow1=nullptr; ID3D11RenderTargetView* g_flow1_rtv=nullptr; ID3D11ShaderResourceView* g_flow1_srv=nullptr;
     ID3D11Texture2D* g_flow2=nullptr; ID3D11RenderTargetView* g_flow2_rtv=nullptr; ID3D11ShaderResourceView* g_flow2_srv=nullptr;
@@ -55,21 +66,69 @@ namespace {
             o.pos=float4(o.uv*float2(2,-2)+float2(-1,1),0,1); return o; }
         float luma(float3 c){ return dot(c,float3(0.299,0.587,0.114)); }
 
-        // Optical flow + a confidence estimate from the match residual.
+        float patch_error_lvl(float2 currUv, float2 prevUv, float2 spread){
+            float e=0.0;
+            e += abs(luma(texCurr.SampleLevel(smp,currUv,0).rgb)-luma(texPrev.SampleLevel(smp,prevUv,0).rgb))*2.0;
+            e += abs(luma(texCurr.SampleLevel(smp,currUv+float2( spread.x,0),0).rgb)-luma(texPrev.SampleLevel(smp,prevUv+float2( spread.x,0),0).rgb));
+            e += abs(luma(texCurr.SampleLevel(smp,currUv+float2(-spread.x,0),0).rgb)-luma(texPrev.SampleLevel(smp,prevUv+float2(-spread.x,0),0).rgb));
+            e += abs(luma(texCurr.SampleLevel(smp,currUv+float2(0, spread.y),0).rgb)-luma(texPrev.SampleLevel(smp,prevUv+float2(0, spread.y),0).rgb));
+            e += abs(luma(texCurr.SampleLevel(smp,currUv+float2(0,-spread.y),0).rgb)-luma(texPrev.SampleLevel(smp,prevUv+float2(0,-spread.y),0).rgb));
+            return e;
+        }
+
+        // Coarse-to-fine pyramid-style optical flow. This mirrors the DX12 path:
+        // first search wide/blurry motion, then refine around that vector. It is
+        // still final-frame optical flow, not native engine motion vectors.
         float4 PSFlow(VSOut i):SV_Target{
-            float2 cuv=i.uv; float bestSad=1e20; float2 bestO=float2(0,0);
-            [loop] for(int oy=-searchR;oy<=searchR;oy+=searchS)
-            [loop] for(int ox=-searchR;ox<=searchR;ox+=searchS){
-                float2 off=float2(ox,oy)*float2(invW,invH); float sad=0;
-                [loop] for(int py=-patchP;py<=patchP;py++)
-                [loop] for(int px=-patchP;px<=patchP;px++){
-                    float2 p=cuv+float2(px,py)*float2(invW,invH)*ds;
-                    sad+=abs(luma(texCurr.SampleLevel(smp,p,0).rgb)-luma(texPrev.SampleLevel(smp,p+off,0).rgb));
+            float2 cuv=i.uv;
+            float2 px=float2(invW,invH);
+            float2 flow=float2(0,0);
+            float best=1e20, second=1e20;
+
+            // Level 0: wide search, coarse details.
+            {
+                float2 stepPx=px*7.0;
+                float2 spread=px*5.0;
+                float2 bestFlow=flow; best=1e20; second=1e20;
+                [unroll] for(int y=-2;y<=2;y++) [unroll] for(int x=-2;x<=2;x++){
+                    float2 cand=flow+float2((float)x,(float)y)*stepPx;
+                    float err=patch_error_lvl(cuv,cuv+cand,spread);
+                    if(err<best){ second=best; best=err; bestFlow=cand; }
+                    else if(err<second) second=err;
                 }
-                if(sad<bestSad){bestSad=sad;bestO=float2(ox,oy);}
+                flow=bestFlow;
             }
-            float conf=saturate(1.0 - bestSad/1.5);   // low residual -> trust this vector
-            return float4(bestO,conf,1);
+            // Level 1: medium refine.
+            {
+                float2 stepPx=px*3.0;
+                float2 spread=px*2.0;
+                float2 bestFlow=flow; best=1e20; second=1e20;
+                [unroll] for(int y=-1;y<=1;y++) [unroll] for(int x=-1;x<=1;x++){
+                    float2 cand=flow+float2((float)x,(float)y)*stepPx;
+                    float err=patch_error_lvl(cuv,cuv+cand,spread);
+                    if(err<best){ second=best; best=err; bestFlow=cand; }
+                    else if(err<second) second=err;
+                }
+                flow=bestFlow;
+            }
+            // Level 2: fine single-pixel refine.
+            {
+                float2 stepPx=px;
+                float2 spread=px;
+                float2 bestFlow=flow; best=1e20; second=1e20;
+                [unroll] for(int y=-1;y<=1;y++) [unroll] for(int x=-1;x<=1;x++){
+                    float2 cand=flow+float2((float)x,(float)y)*stepPx;
+                    float err=patch_error_lvl(cuv,cuv+cand,spread);
+                    if(err<best){ second=best; best=err; bestFlow=cand; }
+                    else if(err<second) second=err;
+                }
+                flow=bestFlow;
+            }
+            float ambiguity=saturate((second-best)*4.0);
+            float quality=1.0-saturate(best*1.6);
+            float conf=saturate(quality*(0.35+0.65*ambiguity));
+            // Store flow in pixels so the existing interpolation path can consume it.
+            return float4(flow/px,conf,1);
         }
 
         // 3x3 average of the flow field: kills speckle / outlier vectors.
@@ -129,6 +188,8 @@ namespace {
     void rel(){
         if(g_prev_srv){g_prev_srv->Release();g_prev_srv=nullptr;} if(g_prev_tex){g_prev_tex->Release();g_prev_tex=nullptr;}
         if(g_curr_srv){g_curr_srv->Release();g_curr_srv=nullptr;} if(g_curr_tex){g_curr_tex->Release();g_curr_tex=nullptr;}
+        if(g_gen_rtv){g_gen_rtv->Release();g_gen_rtv=nullptr;} if(g_gen_tex){g_gen_tex->Release();g_gen_tex=nullptr;}
+        g_generated_ready=false;
         if(g_flow1_srv){g_flow1_srv->Release();g_flow1_srv=nullptr;} if(g_flow1_rtv){g_flow1_rtv->Release();g_flow1_rtv=nullptr;} if(g_flow1){g_flow1->Release();g_flow1=nullptr;}
         if(g_flow2_srv){g_flow2_srv->Release();g_flow2_srv=nullptr;} if(g_flow2_rtv){g_flow2_rtv->Release();g_flow2_rtv=nullptr;} if(g_flow2){g_flow2->Release();g_flow2=nullptr;}
         g_have_prev=false;
@@ -147,6 +208,14 @@ namespace {
         if(FAILED(g_dev->CreateRenderTargetView(*t,nullptr,r)))return false;
         return SUCCEEDED(g_dev->CreateShaderResourceView(*t,nullptr,s));
     }
+    bool mk_generated(const D3D11_TEXTURE2D_DESC& bb){
+        D3D11_TEXTURE2D_DESC d=bb;
+        d.Usage=D3D11_USAGE_DEFAULT;
+        d.BindFlags=D3D11_BIND_RENDER_TARGET;
+        d.CPUAccessFlags=0; d.MiscFlags=0; d.SampleDesc.Count=1; d.SampleDesc.Quality=0;
+        if(FAILED(g_dev->CreateTexture2D(&d,nullptr,&g_gen_tex))) return false;
+        return SUCCEEDED(g_dev->CreateRenderTargetView(g_gen_tex,nullptr,&g_gen_rtv));
+    }
     bool ensure(ID3D11Texture2D* bb){
         D3D11_TEXTURE2D_DESC d{}; bb->GetDesc(&d);
         if(g_prev_tex&&d.Width==g_w&&d.Height==g_h&&d.Format==g_fmt) return true;
@@ -156,6 +225,7 @@ namespace {
         if(!mk_cap(d,&g_curr_tex,&g_curr_srv))return false;
         if(!mk_flow(&g_flow1,&g_flow1_rtv,&g_flow1_srv))return false;
         if(!mk_flow(&g_flow2,&g_flow2_rtv,&g_flow2_srv))return false;
+        if(!mk_generated(d))return false;
         FlowCB cb{g_w,g_h,g_lw,g_lh,1.f/g_w,1.f/g_h,kSearchR,kSearchS,kPatchP,kDS,0,0};
         g_ctx->UpdateSubresource(g_cb,0,nullptr,&cb,0,0);
         LOGF("[fg] resources %ux%u flow=%ux%u (smooth+confidence)",g_w,g_h,g_lw,g_lh);
@@ -166,7 +236,34 @@ namespace {
         if(FAILED(sc->GetDevice(__uuidof(ID3D11Device),(void**)&g_dev)))return false;
         g_dev->GetImmediateContext(&g_ctx);
         if(!compile_pipeline()){LOGF("[fg] pipeline failed");return false;}
-        g_ready=true; LOGF("[fg] initialized (flow + smoothing + confidence)"); return true;
+        QueryPerformanceFrequency(&g_qpc_freq);
+        g_pacing_enabled = true;
+        wchar_t paceBuf[16]{};
+        if (GetEnvironmentVariableW(L"FSRINJ_DX11_PACING", paceBuf, 16) > 0 && paceBuf[0] == L'0')
+            g_pacing_enabled = false;
+        g_ready=true; LOGF("[fg] initialized (pyramid optical flow + smoothing + paced generated present)"); return true;
+    }
+
+    void note_real_present_timing(){
+        LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+        if(g_have_real_timing && g_qpc_freq.QuadPart){
+            double dt=double(now.QuadPart-g_last_real_present.QuadPart)/double(g_qpc_freq.QuadPart);
+            if(dt>0.001 && dt<1.0) g_real_interval_sec = g_real_interval_sec>0.0 ? (g_real_interval_sec*0.90 + dt*0.10) : dt;
+        }
+        g_last_real_present=now; g_have_real_timing=true;
+    }
+    void pace_generated_present(){
+        if(!g_pacing_enabled || !g_have_real_timing || g_real_interval_sec<=0.0 || !g_qpc_freq.QuadPart) return;
+        double target=double(g_pace_fraction)*g_real_interval_sec;
+        double cap=0.90*g_real_interval_sec;
+        if(target>cap) target=cap;
+        LARGE_INTEGER now{}; int guard=0;
+        for(;;){
+            QueryPerformanceCounter(&now);
+            double elapsed=double(now.QuadPart-g_last_real_present.QuadPart)/double(g_qpc_freq.QuadPart);
+            if(elapsed>=target || ++guard>2000000) break;
+            if(target-elapsed>0.0015) Sleep(0); else YieldProcessor();
+        }
     }
 
     struct SB { ID3D11RenderTargetView* rtv=nullptr; ID3D11DepthStencilView* dsv=nullptr;
@@ -193,15 +290,14 @@ namespace {
         g_ctx->PSSetShader(ps,nullptr,0); g_ctx->Draw(3,0);
     }
 
-    void draw_interpolated(ID3D11Texture2D* backbuffer){
-        ID3D11RenderTargetView* bbrtv=nullptr;
-        if(FAILED(g_dev->CreateRenderTargetView(backbuffer,nullptr,&bbrtv))||!bbrtv) return;
+    void draw_interpolated_to(ID3D11RenderTargetView* target){
+        if(!target) return;
         SB s; save(s);
         const FLOAT bf[4]={0,0,0,0}; g_ctx->OMSetBlendState(g_blend,bf,0xffffffff);
         g_ctx->IASetInputLayout(nullptr); g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_ctx->VSSetShader(g_vs,nullptr,0); g_ctx->PSSetSamplers(0,1,&g_smp); g_ctx->PSSetConstantBuffers(0,1,&g_cb);
         ID3D11ShaderResourceView* nul=nullptr;
-        pass(g_flow1_rtv,(float)g_lw,(float)g_lh,g_ps_flow,  g_prev_srv,g_curr_srv,nul);       // raw flow
+        pass(g_flow1_rtv,(float)g_lw,(float)g_lh,g_ps_flow,  g_prev_srv,g_curr_srv,nul);       // raw pyramid flow
         pass(g_flow2_rtv,(float)g_lw,(float)g_lh,g_ps_smooth,nul,nul,g_flow1_srv);             // smoothed flow
 
         // Optional depth-assisted disocclusion (default off; only if a readable depth exists).
@@ -210,28 +306,45 @@ namespace {
         g_ctx->UpdateSubresource(g_cb,0,nullptr,&cb,0,0);
         g_ctx->PSSetShaderResources(3,1,&dsrv);
 
-        pass(bbrtv,(float)g_w,(float)g_h,g_ps_interp, g_prev_srv,g_curr_srv,g_flow2_srv);      // interpolate
+        pass(target,(float)g_w,(float)g_h,g_ps_interp, g_prev_srv,g_curr_srv,g_flow2_srv);      // interpolate
         ID3D11ShaderResourceView* nul4[4]={nullptr,nullptr,nullptr,nullptr}; g_ctx->PSSetShaderResources(0,4,nul4);
-        restore(s); bbrtv->Release();
+        restore(s);
     }
+
 }
 
-void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flags){
+void before_present(IDXGISwapChain* sc, PresentTrampoline, unsigned){
     g_real.fetch_add(1,std::memory_order_relaxed);
-    if(!core::config().framegen_enabled.load()){ g_have_prev=false; return; }
+    if(!core::config().framegen_enabled.load()){ g_have_prev=false; g_generated_ready=false; return; }
     if(!lazy(sc)) return;
     ID3D11Texture2D* bb=nullptr;
     if(FAILED(sc->GetBuffer(0,__uuidof(ID3D11Texture2D),(void**)&bb))||!bb) return;
     if(!ensure(bb)){ bb->Release(); return; }
     g_ctx->CopyResource(g_curr_tex,bb);
-    if(g_have_prev){
-        draw_interpolated(bb);
-        present(sc,0,flags);
-        g_gen.fetch_add(1,std::memory_order_relaxed);
-        g_ctx->CopyResource(bb,g_curr_tex);
+    if(g_have_prev && g_gen_rtv){
+        draw_interpolated_to(g_gen_rtv);
+        g_generated_ready=true;
+    } else {
+        g_generated_ready=false;
     }
     std::swap(g_prev_tex,g_curr_tex); std::swap(g_prev_srv,g_curr_srv);
     g_have_prev=true; bb->Release();
+}
+
+void after_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flags){
+    note_real_present_timing();
+    if(!core::config().framegen_enabled.load() || !present || !g_generated_ready || g_inside_generated_present || !g_gen_tex) return;
+    ID3D11Texture2D* bb=nullptr;
+    if(FAILED(sc->GetBuffer(0,__uuidof(ID3D11Texture2D),(void**)&bb))||!bb) return;
+    if(g_pacing_enabled) pace_generated_present();
+    g_ctx->CopyResource(bb,g_gen_tex);
+    g_inside_generated_present=true;
+    HRESULT hr=present(sc,0,flags);
+    g_inside_generated_present=false;
+    bb->Release();
+    g_generated_ready=false;
+    if(SUCCEEDED(hr)) g_gen.fetch_add(1,std::memory_order_relaxed);
+    else LOGF("[fg] generated Present failed hr=0x%08lX", hr);
 }
 void on_resize(){ rel(); }
 void shutdown(){ rel();

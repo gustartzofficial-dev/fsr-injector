@@ -14,7 +14,12 @@ namespace framegen {
 using PresentTrampoline = long (__stdcall*)(IDXGISwapChain*, unsigned, unsigned);
 
 // Called from the present hook BEFORE the real frame is presented.
+// Captures the current game frame and prepares a generated frame when history exists.
 void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flags);
+
+// Called after the real Present succeeds. Presents the prepared generated frame using
+// pacing so it lands closer to the temporal midpoint between real frames.
+void after_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flags);
 
 void on_resize();
 void shutdown();

@@ -243,3 +243,12 @@ The scout motion-vector candidate path is now staged to avoid crashing immediate
 - F7 after copy is ready toggles actual scout-MV shader usage.
 
 This separates candidate discovery, texture creation, copy/barrier validation, and shader sampling so failures can be isolated more safely.
+
+## DX11 parity update
+
+The DX11 frame-generation path now mirrors two important DX12-side improvements:
+
+- The old single-pass block matcher has been replaced with a coarse-to-fine / pyramid-style optical-flow estimator. It searches wide motion first and then refines around that result, matching the DX12 FSR3-lite motion path more closely.
+- Generated-frame presentation now happens after the real Present with midpoint-style pacing. This reduces the bursty `generated immediately before real frame` behavior from the previous DX11 path.
+
+This is still final-frame optical flow, not engine motion vectors, but it brings DX11 closer to the current DX12 experimental framegen quality path.
