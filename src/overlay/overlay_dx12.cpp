@@ -192,6 +192,27 @@ namespace {
         for (auto& f : g_frames) f.fence_value = 0;
     }
 
+    // Recovery: if Close() or Reset() ever fails, the single shared command list is
+    // left stuck in the recording state and every subsequent Reset() returns
+    // E_INVALIDARG forever -- which silently kills the overlay until the game exits.
+    // Tear the list down and recreate it (closed, ready to Reset) so the next frame
+    // can proceed. Returns true if g_cmd is usable again.
+    bool recover_command_list() {
+        wait_for_gpu_idle();
+        safe_release(g_cmd);
+        if (g_frames.empty() || !g_frames[0].allocator || !g_dev) return false;
+        HRESULT hr = g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                              g_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_cmd));
+        if (FAILED(hr) || !g_cmd) {
+            LOGF("[overlay-dx12] command list recovery failed hr=0x%08lX", hr);
+            g_cmd = nullptr;
+            return false;
+        }
+        g_cmd->Close();
+        LOGF("[overlay-dx12] command list recovered after failure");
+        return true;
+    }
+
     bool compile_shader(const char* source, const char* entry, const char* target, ID3DBlob** blob) {
         UINT flags = 0;
     #if defined(_DEBUG)
@@ -1056,6 +1077,18 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         // Stage 2: copy validation only. Still do not bind the copied texture to the shader
         // unless F7 is pressed again after copy_ready becomes true.
         if (g_scout_motion_copy_requested && !g_scout_motion_copy_ready) {
+            // Guard: CopyTextureRegion cannot copy from a multisampled or non-2D
+            // resource. The flooded "Close failed" brick came from trying to copy an
+            // MSAA RESOLVE_SOURCE buffer the heuristic wrongly tagged as motion data.
+            D3D12_RESOURCE_DESC cand_desc = candidate->GetDesc();
+            if (cand_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || cand_desc.SampleDesc.Count > 1) {
+                LOGF("[overlay-dx12] scout MV stage2 SKIPPED: candidate not plain-copyable (dim=%u samples=%u). "
+                     "This candidate is almost certainly not a velocity buffer.",
+                     (unsigned)cand_desc.Dimension, (unsigned)cand_desc.SampleDesc.Count);
+                g_scout_motion_copy_requested = false;
+                candidate->Release();
+                return;
+            }
             LOGF("[overlay-dx12] scout MV stage2 copy validation begin %ux%u fmt=%u srcState=0x%X",
                  w, h, (unsigned)fmt, (unsigned)candidate_state);
             transition(g_cmd, candidate, candidate_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1341,19 +1374,21 @@ bool on_present(IDXGISwapChain* sc) {
     }
     hr = g_cmd->Reset(f.allocator, nullptr);
     if (FAILED(hr)) {
-        LOGF("[overlay-dx12] command list Reset failed hr=0x%08lX", hr);
+        LOGF("[overlay-dx12] command list Reset failed hr=0x%08lX; recovering", hr);
+        recover_command_list();
         return true;
     }
 
     if (!render_upscale(f)) {
         LOGF("[overlay-dx12] render_upscale returned false; skipping frame");
-        g_cmd->Close();
+        if (FAILED(g_cmd->Close())) recover_command_list();
         return true;
     }
 
     hr = g_cmd->Close();
     if (FAILED(hr)) {
-        LOGF("[overlay-dx12] command list Close failed hr=0x%08lX", hr);
+        LOGF("[overlay-dx12] command list Close failed hr=0x%08lX; recovering", hr);
+        recover_command_list();
         return true;
     }
 
@@ -1393,7 +1428,7 @@ namespace {
         HRESULT hr = f.allocator->Reset();
         if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present allocator Reset failed hr=0x%08lX", hr); return false; }
         hr = g_cmd->Reset(f.allocator, nullptr);
-        if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present command list Reset failed hr=0x%08lX", hr); return false; }
+        if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present command list Reset failed hr=0x%08lX; recovering", hr); recover_command_list(); return false; }
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(g_cmd, g_generated, g_generated_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1402,7 +1437,7 @@ namespace {
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
 
         hr = g_cmd->Close();
-        if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present command list Close failed hr=0x%08lX", hr); return false; }
+        if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present command list Close failed hr=0x%08lX; recovering", hr); recover_command_list(); return false; }
         ID3D12CommandList* lists[] = { g_cmd };
         g_queue->ExecuteCommandLists(1, lists);
         signal_frame(f);
