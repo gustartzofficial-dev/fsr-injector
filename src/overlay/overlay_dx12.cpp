@@ -14,6 +14,12 @@
 #include <cwchar>
 #include <vector>
 
+#include "imgui.h"
+#include "backends/imgui_impl_win32.h"
+#include "backends/imgui_impl_dx12.h"
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
 namespace overlay::dx12 {
 namespace {
     struct FrameContext {
@@ -29,6 +35,16 @@ namespace {
     ID3D12CommandQueue* g_queue = nullptr;
     ID3D12DescriptorHeap* g_rtv_heap = nullptr;
     ID3D12DescriptorHeap* g_srv_heap = nullptr;
+    // --- Dear ImGui overlay (replaces the hand-drawn bitmap UI when available) ---
+    bool g_use_imgui = true;                       // env FSRINJ_DX12_IMGUI=0 forces the legacy UI
+    bool g_imgui_ready = false;                     // true once ImGui DX12 actually initialized
+    ID3D12DescriptorHeap* g_imgui_srv_heap = nullptr; // 1 shader-visible descriptor for the font atlas
+    WNDPROC g_orig_wndproc = nullptr;               // for routing input into ImGui
+    // ImGui helpers (defined below; forward-declared so init/render can call them)
+    bool imgui_init(UINT frame_count);
+    void imgui_shutdown();
+    bool imgui_begin_frame();
+    void imgui_render_to(D3D12_CPU_DESCRIPTOR_HANDLE rtv);
     ID3D12GraphicsCommandList* g_cmd = nullptr;
     ID3D12Fence* g_fence = nullptr;
     ID3D12RootSignature* g_root_sig = nullptr;
@@ -958,6 +974,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_scout_motion_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV") && env_float(L"FSRINJ_DX12_SCOUT_MV", 0.0f) > 0.5f;
         g_scout_motion_use_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV_USE") && env_float(L"FSRINJ_DX12_SCOUT_MV_USE", 0.0f) > 0.5f;
         g_pacing_enabled = !env_disabled(L"FSRINJ_DX12_PACING");
+        g_use_imgui = !env_disabled(L"FSRINJ_DX12_IMGUI");
         g_pace_fraction = (double)env_float(L"FSRINJ_DX12_PACE_FRACTION", 0.5f);
         if (g_pace_fraction < 0.1) g_pace_fraction = 0.1;
         if (g_pace_fraction > 0.9) g_pace_fraction = 0.9;
@@ -983,6 +1000,14 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         }
 
         if (!create_render_targets(sc)) return false;
+
+        if (g_use_imgui && !imgui_init(static_cast<UINT>(g_frames.size()))) {
+            LOGF("[overlay-dx12] ImGui init failed; falling back to legacy hand-drawn UI");
+            imgui_shutdown();
+            g_use_imgui = false;
+        } else if (g_use_imgui) {
+            LOGF("[overlay-dx12] ImGui DX12 overlay active (mouse + software cursor)");
+        }
 
         capture::scout::note_dx12_swapchain(g_width, g_height, g_format);
         capture::scout::note_final_frame_motion(true);
@@ -1191,10 +1216,108 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         }
     }
 
+    LRESULT CALLBACK imgui_wndproc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+        if (g_imgui_ready && g_menu_visible) {
+            if (ImGui_ImplWin32_WndProcHandler(h, msg, w, l)) return 1;
+        }
+        return CallWindowProcW(g_orig_wndproc, h, msg, w, l);
+    }
+
+    bool imgui_init(UINT frame_count) {
+        if (g_imgui_ready) return true;
+        if (!g_dev || !g_hwnd) return false;
+        if (frame_count < 2) frame_count = 2;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 1;   // classic backend only needs one descriptor (the font atlas)
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_imgui_srv_heap))) || !g_imgui_srv_heap)
+            return false;
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;   // don't drop an imgui.ini next to the game exe
+        ImGui::StyleColorsDark();
+        bool w32 = ImGui_ImplWin32_Init(g_hwnd);
+        bool dx = w32 && ImGui_ImplDX12_Init(g_dev, (int)frame_count, g_format, g_imgui_srv_heap,
+                                             g_imgui_srv_heap->GetCPUDescriptorHandleForHeapStart(),
+                                             g_imgui_srv_heap->GetGPUDescriptorHandleForHeapStart());
+        if (!w32 || !dx) {
+            if (dx) ImGui_ImplDX12_Shutdown();
+            if (w32) ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+            safe_release(g_imgui_srv_heap);
+            return false;
+        }
+        g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)imgui_wndproc);
+        g_imgui_ready = true;
+        return true;
+    }
+
+    void imgui_shutdown() {
+        if (g_hwnd && g_orig_wndproc) {
+            SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_orig_wndproc);
+            g_orig_wndproc = nullptr;
+        }
+        if (g_imgui_ready) {
+            ImGui_ImplDX12_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+            g_imgui_ready = false;
+        }
+        safe_release(g_imgui_srv_heap);
+    }
+
+    void imgui_build_menu() {
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        ImGui::Begin("FSR Injector  (DirectX 12)", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::Text("FPS   game %.0f    output %.0f", g_real_fps, g_output_fps);
+        ImGui::Separator();
+        ImGui::Checkbox("Post-process (sharpen / upscale)", &g_effect_enabled);
+        ImGui::SliderFloat("Sharpness", &g_sharpness, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Render scale", &g_scale, 0.50f, 1.0f, "%.2f");
+        ImGui::Separator();
+        ImGui::Checkbox("Frame generation  (F5)", &g_generated_present_enabled);
+        ImGui::Checkbox("Motion interpolation preview  (F4)", &g_interpolation_enabled);
+        ImGui::TextDisabled(g_history_ready ? "History: ready" : "History: warming up");
+        ImGui::Separator();
+        if (ImGui::Button("Quality"))     { g_scale = 0.85f; g_sharpness = 0.30f; } ImGui::SameLine();
+        if (ImGui::Button("Balanced"))    { g_scale = 0.77f; g_sharpness = 0.50f; } ImGui::SameLine();
+        if (ImGui::Button("Performance")) { g_scale = 0.67f; g_sharpness = 0.65f; }
+        ImGui::Separator();
+        ImGui::TextDisabled("Home: show/hide   keys still work alongside the mouse");
+        ImGui::End();
+    }
+
+    // Build the ImGui draw data once per real frame (only when the menu is visible).
+    bool imgui_begin_frame() {
+        if (!g_imgui_ready || !g_menu_visible) return false;
+        ImGui::GetIO().MouseDrawCursor = true;   // always-visible software cursor
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        imgui_build_menu();
+        ImGui::Render();
+        ClipCursor(nullptr);   // unclip so the cursor is reachable even in fullscreen games
+        return true;
+    }
+
+    void imgui_render_to(D3D12_CPU_DESCRIPTOR_HANDLE rtv) {
+        if (!g_imgui_ready) return;
+        ImDrawData* dd = ImGui::GetDrawData();
+        if (!dd || dd->CmdListsCount == 0) return;
+        g_cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        ID3D12DescriptorHeap* heaps[] = { g_imgui_srv_heap };
+        g_cmd->SetDescriptorHeaps(1, heaps);
+        ImGui_ImplDX12_RenderDrawData(dd, g_cmd);
+    }
+
     bool render_upscale(FrameContext& f) {
         if (!g_input || !g_lowres || !g_srv_heap || !g_downscale_pso || !g_easu_rcas_pso || !g_root_sig) return false;
         if (g_width == 0 || g_height == 0 || g_low_width == 0 || g_low_height == 0) return false;
         update_scout_motion_binding();
+        const bool imgui_frame = imgui_begin_frame();              // ImGui path: build menu draw data
+        const bool shader_menu = g_menu_visible && !g_use_imgui;   // legacy bitmap UI only as fallback
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1224,9 +1347,10 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
             bind_fullscreen_state(g_generated_rtv, g_width, g_height, g_easu_rcas_pso,
                                   final_inv_x, final_inv_y,
-                                  g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
+                                  g_sharpness, g_scale, shader_menu, g_effect_enabled,
                                   g_history_ready, true, g_generated_present_enabled,
                                   g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
+            if (imgui_frame) imgui_render_to(g_generated_rtv);   // menu on generated frames too (no flicker)
             transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
             g_generated_ready = true;
@@ -1237,7 +1361,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         bind_fullscreen_state(f.rtv, g_width, g_height, g_easu_rcas_pso,
                               final_inv_x, final_inv_y,
-                              g_sharpness, g_scale, g_menu_visible, g_effect_enabled,
+                              g_sharpness, g_scale, shader_menu, g_effect_enabled,
                               g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
                               g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1250,6 +1374,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_history_ready = true;
         capture::scout::note_dx12_history(true);
 
+        if (imgui_frame) imgui_render_to(f.rtv);   // draw the menu last, into the live backbuffer
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         return true;
     }
@@ -1257,6 +1382,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
 }
 
 void handle_mouse_controls() {
+    if (g_use_imgui && g_imgui_ready) return;   // ImGui owns the mouse via the WndProc hook
     if (!g_menu_visible || !g_hwnd) {
         g_prev_left_mouse = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         return;
@@ -1601,6 +1727,7 @@ void after_present1(IDXGISwapChain1* sc, unsigned int flags, const DXGI_PRESENT_
 
 void shutdown() {
     if (g_init) wait_for_gpu_idle();
+    imgui_shutdown();
     release_frame_resources();
     if (g_fence_event) { CloseHandle(g_fence_event); g_fence_event = nullptr; }
     safe_release(g_fence);
