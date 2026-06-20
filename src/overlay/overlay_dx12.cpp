@@ -630,7 +630,16 @@ float3 fsr3_lite_interpolate(float2 uv, float3 processedCurr) {
     float lumDelta = abs(luma(gHistory.SampleLevel(gSampler, uv, 0.0).rgb) - luma(gInput.SampleLevel(gSampler, uv, 0.0).rgb));
     float reject = saturate(lumDelta * 2.5);
     float3 candidate = lerp(simpleFrame, motionFrame, conf);
-    return saturate(lerp(candidate, processedCurr, reject * 0.55));
+    float3 result = saturate(lerp(candidate, processedCurr, reject * 0.55));
+
+    // HUD/UI protection: where the two real frames are ~identical (a static overlay),
+    // bypass warping so HUD text / crosshairs do not smear as the flow drags them.
+    float3 pcol = gHistory.SampleLevel(gSampler, uv, 0.0).rgb;
+    float3 ccol = gInput.SampleLevel(gSampler, uv, 0.0).rgb;
+    float3 d3 = abs(pcol - ccol);
+    float chg = max(d3.r, max(d3.g, d3.b));
+    float staticMask = saturate(1.0 - chg * 50.0);
+    return lerp(result, ccol, staticMask);
 }
 
 float4 EasuRcasPS(VSOut i) : SV_Target {

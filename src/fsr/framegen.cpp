@@ -55,21 +55,39 @@ namespace {
             o.pos=float4(o.uv*float2(2,-2)+float2(-1,1),0,1); return o; }
         float luma(float3 c){ return dot(c,float3(0.299,0.587,0.114)); }
 
-        // Optical flow + a confidence estimate from the match residual.
+        // One SAD evaluation: compares a 3x3 patch of curr vs prev shifted by candPx.
+        // 'spreadPx' widens the patch taps to emulate a coarser pyramid level.
+        float sad_at(float2 cuv, float2 candPx, float spreadPx){
+            float2 offUv = candPx*float2(invW,invH);
+            float sad=0;
+            [unroll] for(int py=-1;py<=1;py++)
+            [unroll] for(int px=-1;px<=1;px++){
+                float2 p=cuv+float2(px,py)*float2(invW,invH)*spreadPx;
+                sad+=abs(luma(texCurr.SampleLevel(smp,p,0).rgb)-luma(texPrev.SampleLevel(smp,p+offUv,0).rgb));
+            }
+            return sad;
+        }
+
+        // Coarse-to-fine ("pyramid") optical flow: a wide cheap search first, then two
+        // refinement passes. Reaches ~+-20px while staying cheaper than the old fixed
+        // +-12px single search, and tracks fast motion far better.
         float4 PSFlow(VSOut i):SV_Target{
-            float2 cuv=i.uv; float bestSad=1e20; float2 bestO=float2(0,0);
-            [loop] for(int oy=-searchR;oy<=searchR;oy+=searchS)
-            [loop] for(int ox=-searchR;ox<=searchR;ox+=searchS){
-                float2 off=float2(ox,oy)*float2(invW,invH); float sad=0;
-                [loop] for(int py=-patchP;py<=patchP;py++)
-                [loop] for(int px=-patchP;px<=patchP;px++){
-                    float2 p=cuv+float2(px,py)*float2(invW,invH)*ds;
-                    sad+=abs(luma(texCurr.SampleLevel(smp,p,0).rgb)-luma(texPrev.SampleLevel(smp,p+off,0).rgb));
+            float2 cuv=i.uv; float2 flowPx=float2(0,0); float bestSad=1e20;
+            [unroll] for(int lvl=0; lvl<3; lvl++){
+                float stepPx  = (lvl==0)?8.0      :((lvl==1)?3.0 :1.0);
+                float spreadPx= (lvl==0)?(ds*2.0) :((lvl==1)?(float)ds:(ds*0.5));
+                int   rng     = (lvl==0)?2:1;
+                float bSad=1e20; float2 bO=flowPx;
+                [loop] for(int oy=-rng;oy<=rng;oy++)
+                [loop] for(int ox=-rng;ox<=rng;ox++){
+                    float2 candPx=flowPx+float2(ox,oy)*stepPx;
+                    float sad=sad_at(cuv,candPx,spreadPx);
+                    if(sad<bSad){bSad=sad;bO=candPx;}
                 }
-                if(sad<bestSad){bestSad=sad;bestO=float2(ox,oy);}
+                flowPx=bO; bestSad=bSad;
             }
             float conf=saturate(1.0 - bestSad/1.5);   // low residual -> trust this vector
-            return float4(bestO,conf,1);
+            return float4(flowPx,conf,1);
         }
 
         // 3x3 average of the flow field: kills speckle / outlier vectors.
@@ -95,9 +113,17 @@ namespace {
                 float edge=saturate((dx+dy)*40.0);   // depth silhouette = disocclusion risk
                 w*=(1.0-edge);                        // distrust warp on silhouettes
             }
-            float4 plain=lerp(texPrev.SampleLevel(smp,i.uv,0),texCurr.SampleLevel(smp,i.uv,0),0.5);
+            float4 pc=texPrev.SampleLevel(smp,i.uv,0);
+            float4 cc=texCurr.SampleLevel(smp,i.uv,0);
+            float4 plain=lerp(pc,cc,0.5);
             float4 warped=lerp(a,b,0.5);
-            return lerp(plain,warped,w);
+            float4 outc=lerp(plain,warped,w);
+            // HUD/UI protection: where the two real frames are ~identical (a static
+            // overlay), bypass warping entirely so HUD text / crosshairs do not smear.
+            float3 d3=abs(pc.rgb-cc.rgb); float chg=max(d3.r,max(d3.g,d3.b));
+            float staticMask=saturate(1.0 - chg*50.0);
+            outc.rgb=lerp(outc.rgb,cc.rgb,staticMask);
+            return outc;
         }
     )";
 
