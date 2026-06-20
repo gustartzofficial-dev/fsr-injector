@@ -74,6 +74,7 @@ namespace {
     double g_real_interval_sec = 0.0;        // smoothed gap between real presents (EMA)
     bool   g_pacing_enabled = true;          // space generated frame toward the temporal midpoint
     double g_pace_fraction = 0.5;            // 0.5 = halfway between two real frames
+    HANDLE g_pace_timer = nullptr;           // high-resolution waitable timer for low-CPU pacing
     unsigned g_real_present_samples = 0;
     unsigned g_generated_present_samples = 0;
     unsigned g_generated_present_log_count = 0;
@@ -962,6 +963,13 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         if (g_pace_fraction > 0.9) g_pace_fraction = 0.9;
         g_last_real_present_qpc = LARGE_INTEGER{};
         g_real_interval_sec = 0.0;
+        if (!g_pace_timer) {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+            g_pace_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!g_pace_timer) g_pace_timer = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        }
 
         hr = g_dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence));
         if (FAILED(hr)) {
@@ -1537,13 +1545,24 @@ namespace {
         if (target > cap) target = cap;
         if (target <= 0.0) return;
         LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        double elapsed = double(now.QuadPart - g_last_real_present_qpc.QuadPart) / double(g_qpc_freq.QuadPart);
+        double remain = target - elapsed;
+        if (remain <= 0.0) return;
+        // Bulk of the wait on a high-resolution waitable timer (no CPU burn), leaving a
+        // ~0.4ms margin to finish with a short spin for precision. Falls back to the spin
+        // entirely if the timer was unavailable.
+        if (g_pace_timer && remain > 0.0006) {
+            LARGE_INTEGER due{}; due.QuadPart = -(LONGLONG)((remain - 0.0004) * 1.0e7); // 100ns units, relative
+            if (SetWaitableTimerEx(g_pace_timer, &due, 0, nullptr, nullptr, nullptr, 0))
+                WaitForSingleObject(g_pace_timer, 8);
+        }
         int guard = 0;
         for (;;) {
             QueryPerformanceCounter(&now);
-            double elapsed = double(now.QuadPart - g_last_real_present_qpc.QuadPart) / double(g_qpc_freq.QuadPart);
-            if (elapsed >= target || ++guard > 2000000) break;
-            if (target - elapsed > 0.0015) Sleep(0); // yield while far from target
-            else YieldProcessor();                   // tight spin near the target
+            elapsed = double(now.QuadPart - g_last_real_present_qpc.QuadPart) / double(g_qpc_freq.QuadPart);
+            if (elapsed >= target || ++guard > 500000) break;
+            YieldProcessor();
         }
     }
 }
@@ -1595,6 +1614,7 @@ void shutdown() {
     g_logged_first_effect = false;
     g_last_real_present_qpc = LARGE_INTEGER{};
     g_real_interval_sec = 0.0;
+    if (g_pace_timer) { CloseHandle(g_pace_timer); g_pace_timer = nullptr; }
     g_history_ready = false;
     g_interpolation_enabled = false;
     g_generated_present_enabled = false;
