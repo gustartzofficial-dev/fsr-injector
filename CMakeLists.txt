@@ -19,10 +19,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(minhook)
 
 # --- Dear ImGui (overlay) ---
+# Pinned to v1.90.9: the last line of releases using the classic ImGui_ImplDX12_Init
+# signature. 'master' switched DX12 to a new InitInfo API, which is what was crashing
+# the DX12 overlay (API/ABI mismatch). The win32 + dx11 backends are unaffected.
 FetchContent_Declare(
     imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG        master
+    GIT_TAG        v1.90.9
 )
 FetchContent_MakeAvailable(imgui)
 
@@ -41,6 +44,13 @@ target_include_directories(imgui PUBLIC
     ${imgui_SOURCE_DIR}/backends
 )
 target_compile_definitions(imgui PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN)
+
+# MinGW's d3d12 headers miss PFN_D3D12_SERIALIZE_ROOT_SIGNATURE; force-include a shim
+# providing it, scoped to just the DX12 backend translation unit.
+set_source_files_properties(
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp
+    PROPERTIES COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/cmake/mingw_d3d12_shim.h"
+)
 
 # --- Our proxy DLL ---
 # Target is named "fsr_proxy" to avoid colliding with the system "dxgi" import

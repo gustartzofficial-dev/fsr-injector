@@ -30,6 +30,12 @@ namespace {
     unsigned g_periodic_log_count = 0;
     std::unordered_map<SIZE_T, DescriptorInfo> g_descriptors;
 
+    // Set only while the injector is recording its own overlay/ImGui commands on
+    // this thread. Lets the hooks below skip our own work (and ImGui's internal
+    // font-upload list/queue) so it is neither profiled as game rendering nor
+    // re-entered by the generic command-list hooks.
+    thread_local bool g_overlay_active = false;
+
     bool is_depth_format(DXGI_FORMAT f) {
         switch (f) {
             case DXGI_FORMAT_D16_UNORM:
@@ -111,6 +117,8 @@ namespace {
 
 void set_enabled(bool enabled) { std::lock_guard<std::mutex> lk(g_mtx); g_state.enabled = enabled; }
 
+void set_overlay_active(bool active) { g_overlay_active = active; }
+
 void note_dx12_swapchain(unsigned width, unsigned height, DXGI_FORMAT format) {
     std::lock_guard<std::mutex> lk(g_mtx);
     g_state.api = ApiKind::DX12;
@@ -122,9 +130,10 @@ void note_dx12_swapchain(unsigned width, unsigned height, DXGI_FORMAT format) {
 void note_dx12_history(bool ready) { std::lock_guard<std::mutex> lk(g_mtx); g_state.dx12_history_ready = ready; }
 void note_final_frame_motion(bool available) { std::lock_guard<std::mutex> lk(g_mtx); g_state.final_frame_motion = available; }
 void note_dx12_command_list_seen() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_command_lists_seen; }
-void note_dx12_execute_call(unsigned command_list_count) { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_execute_calls; g_state.dx12_command_lists_seen += command_list_count; }
-void note_dx12_draw_call(bool) { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_draw_calls; }
+void note_dx12_execute_call(unsigned command_list_count) { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_execute_calls; g_state.dx12_command_lists_seen += command_list_count; }
+void note_dx12_draw_call(bool) { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_draw_calls; }
 void note_dx12_resource_barrier(unsigned count, const D3D12_RESOURCE_BARRIER* barriers) {
+    if (g_overlay_active) return;
     std::lock_guard<std::mutex> lk(g_mtx);
     g_state.dx12_resource_barriers += count;
     if (!barriers) return;
@@ -141,8 +150,8 @@ void note_dx12_resource_barrier(unsigned count, const D3D12_RESOURCE_BARRIER* ba
         }
     }
 }
-void note_dx12_set_pipeline_state() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_pso_sets; }
-void note_dx12_set_graphics_root_descriptor_table() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_root_table_sets; }
+void note_dx12_set_pipeline_state() { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_pso_sets; }
+void note_dx12_set_graphics_root_descriptor_table() { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_root_table_sets; }
 
 void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc) {
     if (!resource || !handle.ptr) return;
@@ -185,6 +194,7 @@ void note_dx12_dsv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource
 }
 
 void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_handles, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_handle) {
+    if (g_overlay_active) return;
     std::lock_guard<std::mutex> lk(g_mtx);
     g_state.dx12_om_rt_binds += rt_count;
     if (dsv_handle && dsv_handle->ptr) {

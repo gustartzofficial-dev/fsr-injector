@@ -46,6 +46,12 @@ struct Snapshot {
 };
 
 void set_enabled(bool enabled);
+
+// While set on the current thread, the scout ignores command-list/queue activity
+// so the injector's own overlay + ImGui draws are not mistaken for game rendering
+// and ImGui's internal font-upload list/queue is not detoured by our hooks.
+void set_overlay_active(bool active);
+
 void note_dx12_swapchain(unsigned width, unsigned height, DXGI_FORMAT format);
 void note_dx12_history(bool ready);
 void note_final_frame_motion(bool available);

@@ -1250,6 +1250,27 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             return false;
         }
         g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)imgui_wndproc);
+
+        // Build ImGui's device objects now, at init, instead of letting the backend do
+        // it lazily on the first ImGui_ImplDX12_NewFrame(). On v1.90.9 that lazy path
+        // creates a temporary command queue + list and blocks on a fence to upload the
+        // font atlas -- doing that mid-Present, on the render thread, was the most likely
+        // source of the DX12 start crash. The scout guard keeps our generic command-list
+        // hooks from detouring ImGui's internal upload list while it runs.
+        capture::scout::set_overlay_active(true);
+        const bool objs_ok = ImGui_ImplDX12_CreateDeviceObjects();
+        capture::scout::set_overlay_active(false);
+        if (!objs_ok) {
+            LOGF("[overlay-dx12] ImGui_ImplDX12_CreateDeviceObjects failed; disabling ImGui overlay");
+            SetWindowLongPtrW(g_hwnd, GWLP_WNDPROC, (LONG_PTR)g_orig_wndproc);
+            g_orig_wndproc = nullptr;
+            ImGui_ImplDX12_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+            safe_release(g_imgui_srv_heap);
+            return false;
+        }
+
         g_imgui_ready = true;
         return true;
     }
@@ -1292,6 +1313,14 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     // Build the ImGui draw data once per real frame (only when the menu is visible).
     bool imgui_begin_frame() {
         if (!g_imgui_ready || !g_menu_visible) return false;
+        // Skip while minimized / zero-size: ImGui_ImplWin32_NewFrame() would report a
+        // 0x0 display size, which can trip asserts in NewFrame()/RenderDrawData.
+        if (g_hwnd) {
+            if (IsIconic(g_hwnd)) return false;
+            RECT rc{};
+            if (GetClientRect(g_hwnd, &rc) && (rc.right <= rc.left || rc.bottom <= rc.top))
+                return false;
+        }
         ImGui::GetIO().MouseDrawCursor = true;   // always-visible software cursor
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -1315,6 +1344,13 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     bool render_upscale(FrameContext& f) {
         if (!g_input || !g_lowres || !g_srv_heap || !g_downscale_pso || !g_easu_rcas_pso || !g_root_sig) return false;
         if (g_width == 0 || g_height == 0 || g_low_width == 0 || g_low_height == 0) return false;
+        // Everything below records into g_cmd (our upscale passes + ImGui). Mark the
+        // thread so the generic scout ignores our own command-list activity instead of
+        // profiling it / re-entering through the global D3D12 vtable hooks.
+        struct ScoutGuard {
+            ScoutGuard()  { capture::scout::set_overlay_active(true); }
+            ~ScoutGuard() { capture::scout::set_overlay_active(false); }
+        } scout_guard;
         update_scout_motion_binding();
         const bool imgui_frame = imgui_begin_frame();              // ImGui path: build menu draw data
         const bool shader_menu = g_menu_visible && !g_use_imgui;   // legacy bitmap UI only as fallback
@@ -1625,6 +1661,12 @@ namespace {
         if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present allocator Reset failed hr=0x%08lX", hr); return false; }
         hr = g_cmd->Reset(f.allocator, nullptr);
         if (FAILED(hr)) { LOGF("[overlay-dx12] generated-present command list Reset failed hr=0x%08lX; recovering", hr); recover_command_list(); return false; }
+
+        // Our own blit of the generated frame -- keep it out of the scout's view.
+        struct ScoutGuard {
+            ScoutGuard()  { capture::scout::set_overlay_active(true); }
+            ~ScoutGuard() { capture::scout::set_overlay_active(false); }
+        } scout_guard;
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
         transition(g_cmd, g_generated, g_generated_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
