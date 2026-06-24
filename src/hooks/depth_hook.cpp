@@ -1,5 +1,6 @@
 #include "hooks/depth_hook.h"
 #include "core/log.h"
+#include "capture/dx11_resource_logger.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -135,6 +136,7 @@ namespace {
     void STDMETHODCALLTYPE hk_OMSetRT(ID3D11DeviceContext* ctx, UINT num,
                                       ID3D11RenderTargetView* const* rtvs,
                                       ID3D11DepthStencilView* dsv) {
+        capture::dx11log::note_omset_render_targets(num, rtvs, dsv);
         if (dsv) {
             ID3D11Resource* res = nullptr; dsv->GetResource(&res);
             if (res) {

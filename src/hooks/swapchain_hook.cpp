@@ -1,4 +1,5 @@
 #include "hooks/swapchain_hook.h"
+#include "capture/dx11_resource_logger.h"
 #include "overlay/overlay.h"
 #include "fsr/framegen.h"
 #include "fsr/upscaler.h"
@@ -34,6 +35,7 @@ static bool is_d3d11_swapchain(IDXGISwapChain* sc) {
 
 // Classic present path (DISCARD / older games).
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    capture::dx11log::note_swapchain_present(sc);
     const bool d3d11 = is_d3d11_swapchain(sc);
     if (d3d11) {
         upscaler::sharpen(sc);
@@ -57,6 +59,7 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT 
 // Flip-model present path (most modern D3D11 games).
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                              const DXGI_PRESENT_PARAMETERS* pp) {
+    capture::dx11log::note_swapchain_present(sc);
     const bool d3d11 = is_d3d11_swapchain(sc);
     if (d3d11) {
         upscaler::sharpen(sc);
