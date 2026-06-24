@@ -1,0 +1,59 @@
+{
+  "game": "Sonic Frontiers",
+  "route": "DXVK analysis / future Vulkan implementation",
+  "status": "candidate profile, not final implementation",
+  "capture_context": {
+    "api": "Vulkan via DXVK",
+    "present_event": "vkQueuePresentKHR around event 31220 in captured frame",
+    "observed_swapchain_resolution": "1920x1080",
+    "observed_candidate_velocity": {
+      "image": "Image_17361",
+      "format": "R8G8B8A8_UNORM",
+      "extent": "2560x1440",
+      "first_observed_event": 13120,
+      "notes": "Full-screen, scene-shaped, neutral 0.5/0.5 sample observed. Treat as motion-vector candidate until confirmed by consumer shader/resource history."
+    }
+  },
+  "fsr_inputs": {
+    "color_input_hdr": {
+      "role": "HDR scene color before UI/final tonemap if available",
+      "target_format_candidates": ["R16G16B16A16_FLOAT", "R11G11B10_FLOAT"],
+      "required_checks": ["full-screen", "scene color visible", "before UI", "read by TAA/upscale/final composite"]
+    },
+    "motion_vectors": {
+      "role": "per-pixel velocity",
+      "target_format_candidates": ["R8G8B8A8_UNORM", "R16G16_FLOAT", "R16G16_SNORM"],
+      "current_candidate": "Image_17361 / R8G8B8A8_UNORM / 2560x1440",
+      "decode_hypothesis": "velocity.xy = (raw.rg - 0.5) * 2.0 * motionVectorScale",
+      "required_checks": ["changes strongly between still and fast-camera captures", "read by TAA/final resolve pass", "R channel = horizontal tendency", "G channel = vertical tendency"]
+    },
+    "depth": {
+      "role": "scene depth for reprojection/disocclusion",
+      "target_format_candidates": ["D32_FLOAT", "D32_FLOAT_S8X24_UINT", "D24_UNORM_S8_UINT", "R32_FLOAT"],
+      "reverse_z_hypothesis": true,
+      "required_checks": ["near objects around 1.0", "far objects around 0.0", "same render resolution as color/velocity or known scaling"]
+    },
+    "stencil_or_mask": {
+      "role": "optional reactive/object mask",
+      "target_format_candidates": ["stencil aspect of D32_FLOAT_S8X24_UINT", "R8_UINT"],
+      "player_value_hypothesis": 4,
+      "required_checks": ["verify player silhouette", "verify across gameplay contexts before relying on it"]
+    },
+    "output_pre_ui": {
+      "role": "resolved/upscaled output target before HUD/UI",
+      "target_format_candidates": ["R8G8B8A8_UNORM", "B8G8R8A8_UNORM"],
+      "required_checks": ["full scene visible", "no rings/text/minimap/menu yet", "written shortly before UI draw calls"]
+    }
+  },
+  "hook_signature_candidate": {
+    "match_type": "late fullscreen resolve/upscale/TAA pass",
+    "required_state": [
+      "reads HDR/scene color candidate",
+      "reads depth candidate",
+      "reads velocity candidate",
+      "writes pre-UI UNORM color target",
+      "fullscreen triangle or fullscreen quad",
+      "match by pipeline/shader hash plus resource formats and dimensions, not by event number"
+    ]
+  }
+}
