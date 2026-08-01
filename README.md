@@ -25,7 +25,7 @@ This project is licensed under the [MIT License](LICENSE).
 - Runtime scale and sharpness controls.
 - Frame history capture.
 - Experimental motion/interpolation preview.
-- Experimental generated-frame presentation.
+- Experimental generated-frame presentation, with 2x / 3x / 4x multi-frame generation (frames placed at even temporal positions between real frames).
 - FPS/status display in the native overlay.
 - Generic DX12 resource scouting hooks for command lists, render targets, depth targets, barriers, draw calls, and motion-vector-like candidates.
 
@@ -53,6 +53,7 @@ Current test controls are temporary and will eventually be replaced by a proper 
 - `F1/F2/F3` = quality/balanced/performance presets.
 - `F4` = motion/interpolation preview.
 - `F5` = experimental generated-frame presentation.
+- `F8` = cycle frame-generation multiplier (2x / 3x / 4x).
 - `F6` = experimental scout motion-vector candidate usage.
 
 ## Configuration

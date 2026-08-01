@@ -73,7 +73,10 @@ namespace {
     ID3D12Resource* g_input = nullptr;
     ID3D12Resource* g_lowres = nullptr;
     ID3D12Resource* g_history = nullptr;
-    ID3D12Resource* g_generated = nullptr;
+    // Generated interpolated frames. Up to 3 per real frame (4x mode), rendered
+    // at t = k/N between the previous and current real frames, DLSS-MFG style.
+    static const UINT kMaxGenFrames = 3;
+    ID3D12Resource* g_gen[kMaxGenFrames] = {};
     ID3D12Resource* g_scout_motion = nullptr; // private safe copy of scout candidate, never the game-owned resource
     D3D12_RESOURCE_STATES g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
     HANDLE g_fence_event = nullptr;
@@ -82,7 +85,7 @@ namespace {
     UINT g_rtv_stride = 0;
     UINT g_srv_stride = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE g_lowres_rtv{};
-    D3D12_CPU_DESCRIPTOR_HANDLE g_generated_rtv{};
+    D3D12_CPU_DESCRIPTOR_HANDLE g_gen_rtv[kMaxGenFrames] = {};
     DXGI_FORMAT g_format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT g_width = 0;
     UINT g_height = 0;
@@ -102,7 +105,8 @@ namespace {
     bool g_history_ready = false;
     bool g_interpolation_enabled = false;
     bool g_generated_present_enabled = false;
-    bool g_generated_ready = false;
+    unsigned g_gen_ready = 0;   // generated frames rendered & pending present this cycle
+    unsigned g_gen_mult = 2;    // frame-generation multiplier: 2x, 3x, or 4x
     bool g_scout_motion_enabled = false;        // F6: scout candidate validation enabled
     bool g_scout_motion_bound = false;          // true only when the copied MV texture is actively used by shader
     bool g_scout_motion_copy_ready = false;     // private copy exists and copy commands have been recorded successfully
@@ -133,7 +137,7 @@ namespace {
     D3D12_RESOURCE_STATES g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
     D3D12_RESOURCE_STATES g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     D3D12_RESOURCE_STATES g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    D3D12_RESOURCE_STATES g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    D3D12_RESOURCE_STATES g_gen_state[kMaxGenFrames] = { D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET };
     DXGI_FORMAT g_scout_motion_format = DXGI_FORMAT_UNKNOWN;
     unsigned g_scout_motion_width = 0;
     unsigned g_scout_motion_height = 0;
@@ -415,7 +419,8 @@ cbuffer Params : register(b0) {
     float scoutMotion;
     uint4 rcasCon;      // FidelityFX RCAS constants (FsrRcasCon)
     float fsrActive;    // 1.0 when the real EASU pass produced gEasu this frame
-    float3 fsrPad;
+    float interpT;      // temporal position of this generated frame (0..1, prev->curr)
+    float2 fsrPad;
 };
 #ifdef FSRINJ_REAL_FSR
 // Genuine AMD FidelityFX RCAS (MIT), reading the output of the real EASU pass.
@@ -722,10 +727,13 @@ float3 fsr3_lite_interpolate(float2 uv, float3 processedCurr) {
         flow = lerp(flow, mvFlow, mvConf);
         conf = max(conf, mvConf * 0.85);
     }
-    float3 prevWarp = gHistory.SampleLevel(gSampler, uv - flow * 0.50, 0.0).rgb;
-    float3 currWarp = gInput.SampleLevel(gSampler, uv + flow * 0.50, 0.0).rgb;
-    float3 motionFrame = lerp(prevWarp, currWarp, 0.50);
-    float3 simpleFrame = lerp(gHistory.SampleLevel(gSampler, uv, 0.0).rgb, processedCurr, 0.55);
+    // interpT parameterizes WHERE between the two real frames this generated
+    // frame sits (0.25 / 0.5 / 0.75 in 4x mode), DLSS-MFG style.
+    float t = saturate(interpT);
+    float3 prevWarp = gHistory.SampleLevel(gSampler, uv - flow * t, 0.0).rgb;
+    float3 currWarp = gInput.SampleLevel(gSampler, uv + flow * (1.0 - t), 0.0).rgb;
+    float3 motionFrame = lerp(prevWarp, currWarp, t);
+    float3 simpleFrame = lerp(gHistory.SampleLevel(gSampler, uv, 0.0).rgb, processedCurr, saturate(t + 0.05));
 
     // Reject likely disocclusion/scene-change pixels. This keeps fast cuts and UI
     // from exploding into trails, falling back to the safer preview blend/current.
@@ -966,20 +974,19 @@ float4 EasuPS(VSOut i) : SV_Target {
         gen_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         D3D12_CLEAR_VALUE gen_clear{};
         gen_clear.Format = g_format;
-        gen_clear.Color[0] = 0.0f;
-        gen_clear.Color[1] = 0.0f;
-        gen_clear.Color[2] = 0.0f;
         gen_clear.Color[3] = 1.0f;
-        hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &gen_desc,
-                                            D3D12_RESOURCE_STATE_RENDER_TARGET, &gen_clear,
-                                            IID_PPV_ARGS(&g_generated));
-        if (FAILED(hr)) {
-            LOGF("[overlay-dx12] CreateCommittedResource(generated texture) failed hr=0x%08lX %ux%u fmt=%u", hr, g_width, g_height, (unsigned)g_format);
-            return false;
+        for (UINT k = 0; k < kMaxGenFrames; ++k) {
+            hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &gen_desc,
+                                                D3D12_RESOURCE_STATE_RENDER_TARGET, &gen_clear,
+                                                IID_PPV_ARGS(&g_gen[k]));
+            if (FAILED(hr)) {
+                LOGF("[overlay-dx12] CreateCommittedResource(generated texture %u) failed hr=0x%08lX %ux%u fmt=%u", k, hr, g_width, g_height, (unsigned)g_format);
+                return false;
+            }
+            g_gen_state[k] = D3D12_RESOURCE_STATE_RENDER_TARGET;
         }
-        g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_history_ready = false;
-        g_generated_ready = false;
+        g_gen_ready = 0;
 
         // Full-resolution target for the real FidelityFX EASU pass. Created
         // unconditionally because the shader pipeline (which decides g_fsr_real)
@@ -1046,7 +1053,7 @@ float4 EasuPS(VSOut i) : SV_Target {
         safe_release(g_input);
         safe_release(g_lowres);
         safe_release(g_history);
-        safe_release(g_generated);
+        for (UINT k = 0; k < kMaxGenFrames; ++k) { safe_release(g_gen[k]); g_gen_state[k] = D3D12_RESOURCE_STATE_RENDER_TARGET; }
         safe_release(g_easu);
         g_easu_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         safe_release(g_scout_motion);
@@ -1068,9 +1075,8 @@ float4 EasuPS(VSOut i) : SV_Target {
         g_input_state = D3D12_RESOURCE_STATE_COPY_DEST;
         g_lowres_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_history_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
         g_history_ready = false;
-        g_generated_ready = false;
+        g_gen_ready = 0;
     }
 
     bool create_render_targets(IDXGISwapChain* sc) {
@@ -1085,7 +1091,7 @@ float4 EasuPS(VSOut i) : SV_Target {
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
         rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv_desc.NumDescriptors = buffer_count + 3;   // backbuffers + lowres + generated + easu
+        rtv_desc.NumDescriptors = buffer_count + 2 + kMaxGenFrames;   // backbuffers + lowres + easu + generated[3]
         hr = g_dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&g_rtv_heap));
         if (FAILED(hr)) {
             LOGF("[overlay-dx12] CreateDescriptorHeap(RTV) failed hr=0x%08lX", hr);
@@ -1119,13 +1125,13 @@ float4 EasuPS(VSOut i) : SV_Target {
 
         g_lowres_rtv = cpu;
         cpu.ptr += g_rtv_stride;
-        g_generated_rtv = cpu;
-        cpu.ptr += g_rtv_stride;
         g_easu_rtv = cpu;
+        for (UINT k = 0; k < kMaxGenFrames; ++k) { cpu.ptr += g_rtv_stride; g_gen_rtv[k] = cpu; }
         if (!create_upscale_resources_from_backbuffer(g_frames[0].backbuffer)) return false;
         g_dev->CreateRenderTargetView(g_lowres, nullptr, g_lowres_rtv);
-        if (g_generated) g_dev->CreateRenderTargetView(g_generated, nullptr, g_generated_rtv);
         if (g_easu) g_dev->CreateRenderTargetView(g_easu, nullptr, g_easu_rtv);
+        for (UINT k = 0; k < kMaxGenFrames; ++k)
+            if (g_gen[k]) g_dev->CreateRenderTargetView(g_gen[k], nullptr, g_gen_rtv[k]);
         if (!create_upscale_pipeline()) return false;
 
         hr = g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_cmd));
@@ -1179,6 +1185,7 @@ float4 EasuPS(VSOut i) : SV_Target {
         g_scale = env_scale(L"FSRINJ_DX12_SCALE", 0.77f);
         g_interpolation_enabled = opt_bool(L"FSRINJ_DX12_INTERP", false);
         g_generated_present_enabled = g_gen_present_allowed && opt_bool(L"FSRINJ_DX12_GENPRESENT", false);
+        g_gen_mult = (unsigned)core::settings::get_int(L"FSRINJ_DX12_GENMULT", 2, 2, 4);
         g_scout_motion_enabled = opt_bool(L"FSRINJ_DX12_SCOUT_MV", false);
         g_scout_motion_use_enabled = opt_bool(L"FSRINJ_DX12_SCOUT_MV_USE", false);
         g_pacing_enabled = !env_disabled(L"FSRINJ_DX12_PACING");
@@ -1221,11 +1228,11 @@ float4 EasuPS(VSOut i) : SV_Target {
         capture::scout::note_final_frame_motion(true);
         capture::scout::log_snapshot_once();
 
-        LOGF("[overlay-dx12] %s + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
+        LOGF("[overlay-dx12] %s + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s genmult=%ux",
              g_fsr_real ? "AMD FidelityFX FSR 1.0 (EASU+RCAS)" : "FSR1-style EASU/RCAS (legacy approximation)",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
-             static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off");
-        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present F6=scout-MV validate F7=scout-MV use; mouse clicks supported");
+             static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off", g_gen_mult);
+        LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present F6=scout-MV validate F7=scout-MV use F8=FG multiplier (2x/3x/4x); mouse clicks supported");
         return true;
     }
 
@@ -1246,7 +1253,7 @@ float4 EasuPS(VSOut i) : SV_Target {
                                float inv_x, float inv_y, float sharpness, float scale,
                                bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled, bool gen_present_enabled,
                                float real_fps, float output_fps, float scout_on_arg, float /*scout_depth_arg*/, float scout_motion_arg,
-                               bool fsr_active = false) {
+                               bool fsr_active = false, float interp_t = 0.5f) {
         D3D12_VIEWPORT vp{};
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
@@ -1277,7 +1284,8 @@ float4 EasuPS(VSOut i) : SV_Target {
         std::memcpy(blob + 16, g_rcas_con.con, sizeof(g_rcas_con.con));
         const float fsr_active_f = fsr_active ? 1.0f : 0.0f;
         std::memcpy(blob + 20, &fsr_active_f, sizeof(float));
-        blob[21] = blob[22] = blob[23] = 0;
+        std::memcpy(blob + 21, &interp_t, sizeof(float));
+        blob[22] = blob[23] = 0;
         g_cmd->SetGraphicsRoot32BitConstants(1, 24, blob, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
     }
@@ -1541,6 +1549,12 @@ float4 EasuPS(VSOut i) : SV_Target {
         ImGui::Separator();
         if (g_gen_present_allowed) {
             ImGui::Checkbox("Frame generation  (F5)", &g_generated_present_enabled);
+            int mult_idx = (int)g_gen_mult - 2;
+            const char* mults[] = { "2x", "3x", "4x" };
+            if (ImGui::Combo("FG multiplier", &mult_idx, mults, 3)) {
+                g_gen_mult = (unsigned)(mult_idx + 2);
+                LOGF("[overlay-dx12] frame-generation multiplier set to %ux", g_gen_mult);
+            }
         } else {
             g_generated_present_enabled = false;
             ImGui::TextDisabled("Frame generation: off (waitable swapchain; force via INI)");
@@ -1639,21 +1653,28 @@ float4 EasuPS(VSOut i) : SV_Target {
             g_easu_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         }
 
-        if (g_generated_present_enabled && g_generated && g_history_ready) {
-            transition(g_cmd, g_generated, g_generated_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-            g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            bind_fullscreen_state(g_generated_rtv, g_width, g_height, g_easu_rcas_pso,
-                                  final_inv_x, final_inv_y,
-                                  g_sharpness, g_scale, shader_menu, g_effect_enabled,
-                                  g_history_ready, true, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f,
-                                  fsr_active);
-            if (imgui_frame) imgui_render_to(g_generated_rtv);   // menu on generated frames too (no flicker)
-            transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            g_generated_ready = true;
+        if (g_generated_present_enabled && g_history_ready) {
+            const unsigned frames_to_gen = (g_gen_mult >= 2 ? g_gen_mult : 2) - 1;
+            unsigned rendered = 0;
+            for (unsigned k = 0; k < frames_to_gen && k < kMaxGenFrames; ++k) {
+                if (!g_gen[k]) break;
+                const float t = static_cast<float>(k + 1) / static_cast<float>(g_gen_mult);
+                transition(g_cmd, g_gen[k], g_gen_state[k], D3D12_RESOURCE_STATE_RENDER_TARGET);
+                g_gen_state[k] = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                bind_fullscreen_state(g_gen_rtv[k], g_width, g_height, g_easu_rcas_pso,
+                                      final_inv_x, final_inv_y,
+                                      g_sharpness, g_scale, shader_menu, g_effect_enabled,
+                                      g_history_ready, true, g_generated_present_enabled,
+                                      g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f,
+                                      fsr_active, t);
+                if (imgui_frame) imgui_render_to(g_gen_rtv[k]);   // menu on generated frames too (no flicker)
+                transition(g_cmd, g_gen[k], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                g_gen_state[k] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                ++rendered;
+            }
+            g_gen_ready = rendered;
         } else {
-            g_generated_ready = false;
+            g_gen_ready = 0;
         }
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1723,12 +1744,12 @@ void handle_mouse_controls() {
         LOGF("[overlay-dx12] mouse: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
     } else if (inside(20, 136, 245, 156)) {
         g_generated_present_enabled = !g_generated_present_enabled;
-        g_generated_ready = false;
+        g_gen_ready = 0;
         g_generated_present_log_count = 0;
         LOGF("[overlay-dx12] mouse: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
     } else if (inside(20, 160, 245, 180)) {
         g_scout_motion_enabled = !g_scout_motion_enabled;
-        g_generated_ready = false;
+        g_gen_ready = 0;
         LOGF("[overlay-dx12] mouse: scout motion-vector candidate %s (bound=%s)", g_scout_motion_enabled ? "enabled" : "disabled", g_scout_motion_bound ? "yes" : "no");
     }
 
@@ -1812,9 +1833,18 @@ bool on_present(IDXGISwapChain* sc) {
         if (!g_gen_present_allowed) {
             LOGF("[overlay-dx12] F5 ignored: waitable swapchain; set FSRINJ_DX12_GENPRESENT_FORCE=1 in fsrinj.ini to test anyway");
         } else {
-            g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0;
+            g_generated_present_enabled = !g_generated_present_enabled; g_gen_ready = 0; g_generated_present_log_count = 0;
             LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
         }
+    }
+    if (pressed(VK_F8)) {
+        // Cycle 2x -> 3x -> 4x. Takes effect on the next rendered frame; any
+        // already-rendered generated frames this cycle are dropped so the
+        // temporal spacing never mixes multipliers.
+        g_gen_mult = g_gen_mult >= 4 ? 2 : g_gen_mult + 1;
+        g_gen_ready = 0;
+        LOGF("[overlay-dx12] F8: frame-generation multiplier %ux (%u generated frame(s) per real frame)",
+             g_gen_mult, g_gen_mult - 1);
     }
     if (pressed(VK_F6)) {
         g_scout_motion_enabled = !g_scout_motion_enabled;
@@ -1828,7 +1858,7 @@ bool on_present(IDXGISwapChain* sc) {
         g_scout_motion_width = 0;
         g_scout_motion_height = 0;
         g_scout_motion_format = DXGI_FORMAT_UNKNOWN;
-        g_generated_ready = false;
+        g_gen_ready = 0;
         LOGF("[overlay-dx12] F6: scout MV validation %s; stage1=create only, F7=copy/use", g_scout_motion_enabled ? "enabled" : "disabled");
     }
     if (pressed(VK_F7)) {
@@ -1841,7 +1871,7 @@ bool on_present(IDXGISwapChain* sc) {
             LOGF("[overlay-dx12] F7: scout MV copy validation requested; shader use still disabled");
         } else {
             g_scout_motion_use_enabled = !g_scout_motion_use_enabled;
-            g_generated_ready = false;
+            g_gen_ready = 0;
             LOGF("[overlay-dx12] F7: scout MV shader use %s (copy=ready)", g_scout_motion_use_enabled ? "enabled" : "disabled");
         }
     }
@@ -1922,9 +1952,10 @@ void on_after_resize(IDXGISwapChain* sc) {
 
 
 namespace {
-    bool submit_generated_to_current_backbuffer(IDXGISwapChain* sc) {
+    bool submit_generated_to_current_backbuffer(IDXGISwapChain* sc, unsigned k) {
         if (g_device_lost || !g_gen_present_allowed) return false;
-        if (!g_init || !g_sc3 || !g_generated_present_enabled || !g_generated_ready || !g_generated || g_inside_generated_present) return false;
+        if (!g_init || !g_sc3 || !g_generated_present_enabled || g_gen_ready == 0 || g_inside_generated_present) return false;
+        if (k >= kMaxGenFrames || !g_gen[k]) return false;
         if (!g_cmd || !g_queue || g_frames.empty()) return false;
         const UINT idx = g_sc3->GetCurrentBackBufferIndex();
         if (idx >= g_frames.size()) return false;
@@ -1944,9 +1975,9 @@ namespace {
         } scout_guard;
 
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-        transition(g_cmd, g_generated, g_generated_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        g_cmd->CopyResource(f.backbuffer, g_generated);
+        transition(g_cmd, g_gen[k], g_gen_state[k], D3D12_RESOURCE_STATE_COPY_SOURCE);
+        g_gen_state[k] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        g_cmd->CopyResource(f.backbuffer, g_gen[k]);
         transition(g_cmd, f.backbuffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
 
         hr = g_cmd->Close();
@@ -1954,7 +1985,6 @@ namespace {
         ID3D12CommandList* lists[] = { g_cmd };
         g_queue->ExecuteCommandLists(1, lists);
         signal_frame(f);
-        g_generated_ready = false;
         return true;
     }
 
@@ -1981,9 +2011,9 @@ namespace {
     // present count still judders because frames arrive in bursts. Capped so a hitch
     // can never stall the game thread for long. This costs up to ~half a frame of
     // latency on the generated frame; a dedicated present thread would remove that.
-    void pace_generated_present() {
+    void pace_generated_present(double fraction) {
         if (!g_pacing_enabled || g_real_interval_sec <= 0.0 || g_qpc_freq.QuadPart == 0) return;
-        double target = g_pace_fraction * g_real_interval_sec;
+        double target = fraction * g_real_interval_sec;
         double cap = g_real_interval_sec * 0.9;
         if (target > cap) target = cap;
         if (target <= 0.0) return;
@@ -2012,34 +2042,47 @@ namespace {
 
 void after_present(IDXGISwapChain* sc, unsigned int flags, PresentFn present_fn) {
     note_real_present_timing();
-    if (!present_fn || !submit_generated_to_current_backbuffer(sc)) return;
-    pace_generated_present();
-    g_inside_generated_present = true;
-    HRESULT hr = present_fn(sc, 0, flags);
-    g_inside_generated_present = false;
-    if (SUCCEEDED(hr)) {
+    if (!present_fn || g_gen_ready == 0) return;
+    const unsigned count = g_gen_ready;
+    const unsigned mult = count + 1;
+    for (unsigned k = 0; k < count; ++k) {
+        if (!submit_generated_to_current_backbuffer(sc, k)) break;
+        // 2x keeps the user-tunable midpoint; 3x/4x space frames evenly at k/N.
+        pace_generated_present(mult == 2 ? g_pace_fraction
+                                         : static_cast<double>(k + 1) / static_cast<double>(mult));
+        g_inside_generated_present = true;
+        HRESULT hr = present_fn(sc, 0, flags);
+        g_inside_generated_present = false;
+        if (FAILED(hr)) { LOGF("[overlay-dx12] generated Present failed hr=0x%08lX", hr); break; }
         update_fps_counters(1);
         ++g_generated_present_log_count;
         if (g_generated_present_log_count == 1 || (g_generated_present_log_count % 120u) == 0u)
-            LOGF("[overlay-dx12] experimental generated frame presented count=%u", g_generated_present_log_count);
-    } else LOGF("[overlay-dx12] generated Present failed hr=0x%08lX", hr);
+            LOGF("[overlay-dx12] experimental generated frame presented count=%u (x%u mode)", g_generated_present_log_count, mult);
+    }
+    g_gen_ready = 0;
 }
 
 void after_present1(IDXGISwapChain1* sc, unsigned int flags, const DXGI_PRESENT_PARAMETERS* pp, Present1Fn present1_fn) {
     note_real_present_timing();
-    if (!present1_fn || !submit_generated_to_current_backbuffer(reinterpret_cast<IDXGISwapChain*>(sc))) return;
-    pace_generated_present();
-    g_inside_generated_present = true;
+    if (!present1_fn || g_gen_ready == 0) return;
     DXGI_PRESENT_PARAMETERS empty{};
     const DXGI_PRESENT_PARAMETERS* use_pp = pp ? pp : &empty;
-    HRESULT hr = present1_fn(sc, 0, flags, use_pp);
-    g_inside_generated_present = false;
-    if (SUCCEEDED(hr)) {
+    const unsigned count = g_gen_ready;
+    const unsigned mult = count + 1;
+    for (unsigned k = 0; k < count; ++k) {
+        if (!submit_generated_to_current_backbuffer(reinterpret_cast<IDXGISwapChain*>(sc), k)) break;
+        pace_generated_present(mult == 2 ? g_pace_fraction
+                                         : static_cast<double>(k + 1) / static_cast<double>(mult));
+        g_inside_generated_present = true;
+        HRESULT hr = present1_fn(sc, 0, flags, use_pp);
+        g_inside_generated_present = false;
+        if (FAILED(hr)) { LOGF("[overlay-dx12] generated Present1 failed hr=0x%08lX", hr); break; }
         update_fps_counters(1);
         ++g_generated_present_log_count;
         if (g_generated_present_log_count == 1 || (g_generated_present_log_count % 120u) == 0u)
-            LOGF("[overlay-dx12] experimental generated frame presented via Present1 count=%u", g_generated_present_log_count);
-    } else LOGF("[overlay-dx12] generated Present1 failed hr=0x%08lX", hr);
+            LOGF("[overlay-dx12] experimental generated frame presented via Present1 count=%u (x%u mode)", g_generated_present_log_count, mult);
+    }
+    g_gen_ready = 0;
 }
 
 void shutdown() {
@@ -2062,7 +2105,7 @@ void shutdown() {
     g_history_ready = false;
     g_interpolation_enabled = false;
     g_generated_present_enabled = false;
-    g_generated_ready = false;
+    g_gen_ready = 0;
     g_inside_generated_present = false;
     g_prev_left_mouse = false;
     g_qpc_freq = LARGE_INTEGER{};
