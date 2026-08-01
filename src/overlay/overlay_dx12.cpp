@@ -4,6 +4,13 @@
 #include "core/log.h"
 #include "core/settings.h"
 #include "capture/generic_resource_scout.h"
+#include "fsr/fsr1_constants.h"
+
+// Embedded copies of AMD's FidelityFX FSR1 headers (MIT), generated at build
+// time from third_party/ffx by cmake/embed_text_file.cmake. Served to
+// D3DCompile through the ID3DInclude handler below.
+#include "ffx_a_embedded.h"
+#include "ffx_fsr1_embedded.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -51,6 +58,18 @@ namespace {
     ID3D12RootSignature* g_root_sig = nullptr;
     ID3D12PipelineState* g_downscale_pso = nullptr;
     ID3D12PipelineState* g_easu_rcas_pso = nullptr;
+    // Real FidelityFX FSR1 path (vendored ffx_fsr1.h): a dedicated EASU pass into
+    // g_easu, then genuine RCAS in the final composite pass. When the shaders fail
+    // to compile at runtime for any reason, g_fsr_real stays false and the legacy
+    // approximation path keeps working exactly as before.
+    ID3D12PipelineState* g_fsr_easu_pso = nullptr;
+    ID3D12Resource* g_easu = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE g_easu_rtv{};
+    D3D12_RESOURCE_STATES g_easu_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bool g_fsr_real = false;
+    fsr1::EasuConstants g_easu_con{};
+    fsr1::RcasConstants g_rcas_con{};
+    float g_rcas_con_for_sharpness = -1.0f;
     ID3D12Resource* g_input = nullptr;
     ID3D12Resource* g_lowres = nullptr;
     ID3D12Resource* g_history = nullptr;
@@ -265,21 +284,43 @@ namespace {
         return true;
     }
 
-    bool compile_shader(const char* source, const char* entry, const char* target, ID3DBlob** blob) {
+    // Serves the embedded FidelityFX headers to the runtime HLSL compiler, so the
+    // shaders can '#include "ffx_a.h"' with no files on disk next to the game.
+    class FfxInclude : public ID3DInclude {
+    public:
+        HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE, LPCSTR file, LPCVOID,
+                                       LPCVOID* out_data, UINT* out_size) override {
+            if (!file || !out_data || !out_size) return E_FAIL;
+            if (std::strcmp(file, "ffx_a.h") == 0) {
+                *out_data = g_ffx_a_h; *out_size = g_ffx_a_h_len; return S_OK;
+            }
+            if (std::strcmp(file, "ffx_fsr1.h") == 0) {
+                *out_data = g_ffx_fsr1_h; *out_size = g_ffx_fsr1_h_len; return S_OK;
+            }
+            return E_FAIL;
+        }
+        HRESULT STDMETHODCALLTYPE Close(LPCVOID) override { return S_OK; }
+    };
+    FfxInclude g_ffx_include;
+
+    bool compile_shader(const char* source, const char* entry, const char* target, ID3DBlob** blob,
+                        const D3D_SHADER_MACRO* defines = nullptr, bool quiet = false) {
         UINT flags = 0;
     #if defined(_DEBUG)
         flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
     #endif
         ID3DBlob* errors = nullptr;
-        HRESULT hr = D3DCompile(source, std::strlen(source), nullptr, nullptr, nullptr,
+        HRESULT hr = D3DCompile(source, std::strlen(source), "fsrinj", defines, &g_ffx_include,
                                 entry, target, flags, 0, blob, &errors);
         if (FAILED(hr)) {
             if (errors) {
-                LOGF("[overlay-dx12] D3DCompile %s/%s failed hr=0x%08lX: %s", entry, target, hr,
+                LOGF("[overlay-dx12] D3DCompile %s/%s failed hr=0x%08lX%s: %s", entry, target, hr,
+                     quiet ? " (falling back)" : "",
                      static_cast<const char*>(errors->GetBufferPointer()));
                 errors->Release();
             } else {
-                LOGF("[overlay-dx12] D3DCompile %s/%s failed hr=0x%08lX", entry, target, hr);
+                LOGF("[overlay-dx12] D3DCompile %s/%s failed hr=0x%08lX%s", entry, target, hr,
+                     quiet ? " (falling back)" : "");
             }
             return false;
         }
@@ -290,7 +331,7 @@ namespace {
     bool create_upscale_pipeline() {
         D3D12_DESCRIPTOR_RANGE range{};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        range.NumDescriptors = 4;
+        range.NumDescriptors = 5;   // t0..t3 legacy inputs + t4 EASU result
         range.BaseShaderRegister = 0;
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
@@ -303,7 +344,7 @@ namespace {
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[1].Constants.ShaderRegister = 0;
         params[1].Constants.RegisterSpace = 0;
-        params[1].Constants.Num32BitValues = 16;
+        params[1].Constants.Num32BitValues = 24;   // 16 legacy params + RCAS con + fsrActive + pad
         params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler{};
@@ -355,6 +396,7 @@ Texture2D<float4> gInput : register(t0);
 Texture2D<float4> gHistory : register(t1);
 Texture2D<float4> gLowres : register(t2);
 Texture2D<float4> gScoutMotion : register(t3);
+Texture2D<float4> gEasu : register(t4);
 SamplerState gSampler : register(s0);
 cbuffer Params : register(b0) {
     float2 invSize;
@@ -371,7 +413,20 @@ cbuffer Params : register(b0) {
     float scoutOn;
     float scoutDepth;
     float scoutMotion;
+    uint4 rcasCon;      // FidelityFX RCAS constants (FsrRcasCon)
+    float fsrActive;    // 1.0 when the real EASU pass produced gEasu this frame
+    float3 fsrPad;
 };
+#ifdef FSRINJ_REAL_FSR
+// Genuine AMD FidelityFX RCAS (MIT), reading the output of the real EASU pass.
+#define A_GPU 1
+#define A_HLSL 1
+#include "ffx_a.h"
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return gEasu.Load(int3(p, 0)); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "ffx_fsr1.h"
+#endif
 struct VSOut {
     float4 pos : SV_Position;
     float2 uv : TEXCOORD0;
@@ -693,10 +748,21 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     float4 base = gInput.SampleLevel(gSampler, i.uv, 0.0);
     float3 color = base.rgb;
     if (effectOn > 0.5) {
+#ifdef FSRINJ_REAL_FSR
+        if (fsrActive > 0.5) {
+            // Real FidelityFX RCAS over the real EASU result rendered into gEasu.
+            float3 rc;
+            FsrRcasF(rc.r, rc.g, rc.b, AU2(i.pos.xy), rcasCon);
+            color = saturate(rc);
+        } else {
+#endif
         float3 up = fsr1_easu(i.uv);
         float3 sharp = fsr1_rcas(i.uv, invSize, sharpness);
         float amount = saturate(0.45 + sharpness * 0.55);
         color = saturate(lerp(up, sharp, amount));
+#ifdef FSRINJ_REAL_FSR
+        }
+#endif
     }
     if (interpOn > 0.5 && historyReady > 0.5) {
         // Motion-aware FSR3-lite preview. It estimates optical flow from the final
@@ -708,12 +774,63 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
     return float4(color, base.a);
 })HLSL";
 
+        // The standalone EASU pass: genuine AMD FidelityFX EASU (MIT) rendering the
+        // low-res source up to full resolution into g_easu. RCAS then runs in the
+        // main composite shader above.
+        const char* fsr_easu_hlsl =
+R"HLSL(
+#define A_GPU 1
+#define A_HLSL 1
+#include "ffx_a.h"
+cbuffer EasuCB : register(b0) { uint4 con0; uint4 con1; uint4 con2; uint4 con3; };
+Texture2D<float4> gLowres : register(t2);
+SamplerState gSampler : register(s0);
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return gLowres.GatherRed(gSampler, p); }
+AF4 FsrEasuGF(AF2 p) { return gLowres.GatherGreen(gSampler, p); }
+AF4 FsrEasuBF(AF2 p) { return gLowres.GatherBlue(gSampler, p); }
+#include "ffx_fsr1.h"
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    float2 p;
+    if (id == 0) p = float2(-1.0, -1.0);
+    else if (id == 1) p = float2(-1.0, 3.0);
+    else p = float2(3.0, -1.0);
+    o.pos = float4(p, 0.0, 1.0);
+    o.uv = float2(0.5 * p.x + 0.5, -0.5 * p.y + 0.5);
+    return o;
+}
+float4 EasuPS(VSOut i) : SV_Target {
+    AF3 c = AF3(0.0, 0.0, 0.0);
+    FsrEasuF(c, AU2(i.pos.xy), con0, con1, con2, con3);
+    return float4(c, 1.0);
+}
+)HLSL";
+
         ID3DBlob* vs = nullptr;
         ID3DBlob* ps_down = nullptr;
         ID3DBlob* ps_easu = nullptr;
-        if (!compile_shader(hlsl, "VSMain", "vs_5_0", &vs)) return false;
-        if (!compile_shader(hlsl, "DownscalePS", "ps_5_0", &ps_down)) { vs->Release(); return false; }
-        if (!compile_shader(hlsl, "EasuRcasPS", "ps_5_0", &ps_easu)) { vs->Release(); ps_down->Release(); return false; }
+        ID3DBlob* vs_fsr = nullptr;
+        ID3DBlob* ps_fsr_easu = nullptr;
+
+        // Try the real-FidelityFX build of the composite shader first; if the
+        // vendored headers ever fail to compile on some runtime, fall back to the
+        // legacy dependency-free build so the injector keeps working.
+        const D3D_SHADER_MACRO fsr_defines[] = { { "FSRINJ_REAL_FSR", "1" }, { nullptr, nullptr } };
+        g_fsr_real = compile_shader(hlsl, "VSMain", "vs_5_0", &vs, fsr_defines, true) &&
+                     compile_shader(hlsl, "DownscalePS", "ps_5_0", &ps_down, fsr_defines, true) &&
+                     compile_shader(hlsl, "EasuRcasPS", "ps_5_0", &ps_easu, fsr_defines, true) &&
+                     compile_shader(fsr_easu_hlsl, "VSMain", "vs_5_0", &vs_fsr, nullptr, true) &&
+                     compile_shader(fsr_easu_hlsl, "EasuPS", "ps_5_0", &ps_fsr_easu, nullptr, true);
+        if (!g_fsr_real) {
+            safe_release(vs); safe_release(ps_down); safe_release(ps_easu);
+            safe_release(vs_fsr); safe_release(ps_fsr_easu);
+            LOGF("[overlay-dx12] FidelityFX FSR1 shader path unavailable; using legacy approximation shaders");
+            if (!compile_shader(hlsl, "VSMain", "vs_5_0", &vs)) return false;
+            if (!compile_shader(hlsl, "DownscalePS", "ps_5_0", &ps_down)) { vs->Release(); return false; }
+            if (!compile_shader(hlsl, "EasuRcasPS", "ps_5_0", &ps_easu)) { vs->Release(); ps_down->Release(); return false; }
+        }
 
         auto fill_pso = [&](ID3DBlob* ps, ID3D12PipelineState** out) -> bool {
             D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
@@ -759,9 +876,25 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         };
 
         bool ok = fill_pso(ps_down, &g_downscale_pso) && fill_pso(ps_easu, &g_easu_rcas_pso);
+        if (ok && g_fsr_real) {
+            // Same fixed-function state as the other passes, but with the FSR
+            // wrapper's own VS/PS blobs. Failure here just drops back to legacy.
+            ID3DBlob* saved_vs = vs;
+            vs = vs_fsr;
+            if (!fill_pso(ps_fsr_easu, &g_fsr_easu_pso)) {
+                g_fsr_real = false;
+                safe_release(g_fsr_easu_pso);
+                LOGF("[overlay-dx12] FSR EASU PSO creation failed; using legacy approximation shaders");
+            }
+            vs = saved_vs;
+        }
+        if (ok) LOGF("[overlay-dx12] upscale pipeline ready (%s)",
+                     g_fsr_real ? "AMD FidelityFX FSR 1.0 EASU+RCAS" : "legacy approximation");
         vs->Release();
         ps_down->Release();
         ps_easu->Release();
+        safe_release(vs_fsr);
+        safe_release(ps_fsr_easu);
         return ok;
     }
 
@@ -848,9 +981,35 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_history_ready = false;
         g_generated_ready = false;
 
+        // Full-resolution target for the real FidelityFX EASU pass. Created
+        // unconditionally because the shader pipeline (which decides g_fsr_real)
+        // is compiled *after* resources; the render path only uses FSR when the
+        // texture, the PSO, and the shader build are all present.
+        {
+            D3D12_RESOURCE_DESC easu_desc = input_desc;
+            easu_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            D3D12_CLEAR_VALUE easu_clear{};
+            easu_clear.Format = g_format;
+            easu_clear.Color[3] = 1.0f;
+            hr = g_dev->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &easu_desc,
+                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &easu_clear,
+                                                IID_PPV_ARGS(&g_easu));
+            if (FAILED(hr)) {
+                LOGF("[overlay-dx12] CreateCommittedResource(easu texture) failed hr=0x%08lX; real FSR path unavailable", hr);
+                g_easu = nullptr;
+            }
+            g_easu_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+
+        // Precompute the FidelityFX constants for this resolution pair.
+        fsr1::easu_constants(g_easu_con,
+                             (float)g_low_width, (float)g_low_height,
+                             (float)g_width, (float)g_height);
+        g_rcas_con_for_sharpness = -1.0f; // force refresh on next frame
+
         D3D12_DESCRIPTOR_HEAP_DESC srv_desc{};
         srv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        srv_desc.NumDescriptors = 4;
+        srv_desc.NumDescriptors = 5;
         srv_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = g_dev->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&g_srv_heap));
         if (FAILED(hr)) {
@@ -871,6 +1030,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_dev->CreateShaderResourceView(g_history, &view, srv_cpu(1));
         g_dev->CreateShaderResourceView(g_lowres, &view, srv_cpu(2));
         g_dev->CreateShaderResourceView(nullptr, &view, srv_cpu(3));
+        g_dev->CreateShaderResourceView(g_easu, &view, srv_cpu(4));
         return true;
     }
 
@@ -887,6 +1047,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         safe_release(g_lowres);
         safe_release(g_history);
         safe_release(g_generated);
+        safe_release(g_easu);
+        g_easu_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         safe_release(g_scout_motion);
         g_scout_motion_state = D3D12_RESOURCE_STATE_COPY_DEST;
         g_scout_motion_bound = false;
@@ -896,6 +1058,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         safe_release(g_srv_heap);
         safe_release(g_downscale_pso);
         safe_release(g_easu_rcas_pso);
+        safe_release(g_fsr_easu_pso);
         safe_release(g_root_sig);
         safe_release(g_rtv_heap);
         g_width = 0;
@@ -922,7 +1085,7 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
 
         D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{};
         rtv_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rtv_desc.NumDescriptors = buffer_count + 2;
+        rtv_desc.NumDescriptors = buffer_count + 3;   // backbuffers + lowres + generated + easu
         hr = g_dev->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&g_rtv_heap));
         if (FAILED(hr)) {
             LOGF("[overlay-dx12] CreateDescriptorHeap(RTV) failed hr=0x%08lX", hr);
@@ -957,9 +1120,12 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         g_lowres_rtv = cpu;
         cpu.ptr += g_rtv_stride;
         g_generated_rtv = cpu;
+        cpu.ptr += g_rtv_stride;
+        g_easu_rtv = cpu;
         if (!create_upscale_resources_from_backbuffer(g_frames[0].backbuffer)) return false;
         g_dev->CreateRenderTargetView(g_lowres, nullptr, g_lowres_rtv);
         if (g_generated) g_dev->CreateRenderTargetView(g_generated, nullptr, g_generated_rtv);
+        if (g_easu) g_dev->CreateRenderTargetView(g_easu, nullptr, g_easu_rtv);
         if (!create_upscale_pipeline()) return false;
 
         hr = g_dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_frames[0].allocator, nullptr, IID_PPV_ARGS(&g_cmd));
@@ -1051,7 +1217,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         capture::scout::note_final_frame_motion(true);
         capture::scout::log_snapshot_once();
 
-        LOGF("[overlay-dx12] FSR1-style EASU/RCAS + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
+        LOGF("[overlay-dx12] %s + native UI initialized on hwnd %p buffers=%u size=%ux%u lowres=%ux%u scale=%.2f format=%u queue=%p enabled=%s sharpness=%.2f genpresent=%s",
+             g_fsr_real ? "AMD FidelityFX FSR 1.0 (EASU+RCAS)" : "FSR1-style EASU/RCAS (legacy approximation)",
              static_cast<void*>(g_hwnd), (unsigned)g_frames.size(), g_width, g_height, g_low_width, g_low_height, g_scale, (unsigned)g_format,
              static_cast<void*>(g_queue), g_effect_enabled ? "on" : "off", g_sharpness, g_generated_present_enabled ? "on" : "off");
         LOGF("[overlay-dx12] Native DX12 settings overlay is enabled; Home=menu End=effect PgUp/PgDn=sharpness Insert/Delete=scale F1/F2/F3=presets F4=motion-preview F5=generated-present F6=scout-MV validate F7=scout-MV use; mouse clicks supported");
@@ -1074,7 +1241,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                ID3D12PipelineState* pso,
                                float inv_x, float inv_y, float sharpness, float scale,
                                bool menu_visible, bool effect_enabled, bool history_ready, bool interp_enabled, bool gen_present_enabled,
-                               float real_fps, float output_fps, float scout_on_arg, float /*scout_depth_arg*/, float scout_motion_arg) {
+                               float real_fps, float output_fps, float scout_on_arg, float /*scout_depth_arg*/, float scout_motion_arg,
+                               bool fsr_active = false) {
         D3D12_VIEWPORT vp{};
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
@@ -1098,7 +1266,38 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         const float scout_use = scout_on_arg > 0.5f ? 1.0f : 0.0f;
         const float scout_mv_ready = scout_motion_arg > 0.5f ? 1.0f : (scout_motion_ready ? 1.0f : 0.0f);
         const float params[16] = { inv_x, inv_y, sharpness, scale, 1.0f / static_cast<float>(g_width ? g_width : width), 1.0f / static_cast<float>(g_height ? g_height : height), menu_visible ? 1.0f : 0.0f, effect_enabled ? 1.0f : 0.0f, history_ready ? 1.0f : 0.0f, interp_enabled ? 1.0f : 0.0f, gen_present_enabled ? 1.0f : 0.0f, real_fps, output_fps, scout_use, scout_depth_ready ? 1.0f : 0.0f, scout_mv_ready };
-        g_cmd->SetGraphicsRoot32BitConstants(1, 16, params, 0);
+        // Root constants are typeless 32-bit values: floats first, then the RCAS
+        // uint constants, then the fsrActive flag (matches the cbuffer layout).
+        UINT32 blob[24];
+        std::memcpy(blob, params, sizeof(params));
+        std::memcpy(blob + 16, g_rcas_con.con, sizeof(g_rcas_con.con));
+        const float fsr_active_f = fsr_active ? 1.0f : 0.0f;
+        std::memcpy(blob + 20, &fsr_active_f, sizeof(float));
+        blob[21] = blob[22] = blob[23] = 0;
+        g_cmd->SetGraphicsRoot32BitConstants(1, 24, blob, 0);
+        g_cmd->DrawInstanced(3, 1, 0, 0);
+    }
+
+    // Real FidelityFX EASU pass: reads the low-res texture (t2), writes the
+    // full-resolution reconstruction into g_easu. Constants are AMD's packed
+    // uint4 blocks computed on the CPU by the very same vendored header.
+    void bind_easu_pass() {
+        D3D12_VIEWPORT vp{};
+        vp.Width = static_cast<float>(g_width);
+        vp.Height = static_cast<float>(g_height);
+        vp.MinDepth = 0.0f;
+        vp.MaxDepth = 1.0f;
+        D3D12_RECT scissor{ 0, 0, static_cast<LONG>(g_width), static_cast<LONG>(g_height) };
+        g_cmd->OMSetRenderTargets(1, &g_easu_rtv, FALSE, nullptr);
+        g_cmd->RSSetViewports(1, &vp);
+        g_cmd->RSSetScissorRects(1, &scissor);
+        ID3D12DescriptorHeap* heaps[] = { g_srv_heap };
+        g_cmd->SetDescriptorHeaps(1, heaps);
+        g_cmd->SetGraphicsRootSignature(g_root_sig);
+        g_cmd->SetPipelineState(g_fsr_easu_pso);
+        g_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_cmd->SetGraphicsRootDescriptorTable(0, srv_gpu(0));
+        g_cmd->SetGraphicsRoot32BitConstants(1, 16, g_easu_con.con, 0);
         g_cmd->DrawInstanced(3, 1, 0, 0);
     }
 
@@ -1421,6 +1620,21 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
             final_inv_y = 1.0f / static_cast<float>(g_low_height);
         }
 
+        // Real FidelityFX FSR 1.0: EASU reconstructs low-res -> full-res into
+        // g_easu here; the composite passes below then run genuine RCAS on it.
+        const bool fsr_active = g_fsr_real && g_easu && g_fsr_easu_pso && g_effect_enabled;
+        if (fsr_active) {
+            if (g_rcas_con_for_sharpness != g_sharpness) {
+                fsr1::rcas_constants(g_rcas_con, fsr1::slider_to_stops(g_sharpness));
+                g_rcas_con_for_sharpness = g_sharpness;
+            }
+            transition(g_cmd, g_easu, g_easu_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            g_easu_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            bind_easu_pass();
+            transition(g_cmd, g_easu, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            g_easu_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+
         if (g_generated_present_enabled && g_generated && g_history_ready) {
             transition(g_cmd, g_generated, g_generated_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
             g_generated_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1428,7 +1642,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                                   final_inv_x, final_inv_y,
                                   g_sharpness, g_scale, shader_menu, g_effect_enabled,
                                   g_history_ready, true, g_generated_present_enabled,
-                                  g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
+                                  g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f,
+                                  fsr_active);
             if (imgui_frame) imgui_render_to(g_generated_rtv);   // menu on generated frames too (no flicker)
             transition(g_cmd, g_generated, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
             g_generated_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -1442,7 +1657,8 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
                               final_inv_x, final_inv_y,
                               g_sharpness, g_scale, shader_menu, g_effect_enabled,
                               g_history_ready, g_interpolation_enabled, g_generated_present_enabled,
-                              g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f);
+                              g_real_fps, g_output_fps, g_scout_motion_bound ? 1.0f : 0.0f, 0.0f, g_scout_motion_copy_ready ? 1.0f : 0.0f,
+                              fsr_active);
         transition(g_cmd, g_input, g_input_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
         g_input_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
         transition(g_cmd, g_history, g_history_state, D3D12_RESOURCE_STATE_COPY_DEST);

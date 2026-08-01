@@ -72,9 +72,18 @@ add_library(fsr_proxy SHARED
     src/fsr/upscaler.cpp
     src/core/log.cpp
     src/core/settings.cpp
+    src/fsr/fsr1_constants.cpp
 )
 
-target_include_directories(fsr_proxy PRIVATE src)
+# Embed the vendored FidelityFX FSR1 headers (MIT, see third_party/ffx/LICENSE.txt)
+# so the runtime HLSL compiler can #include them from memory.
+include(cmake/embed_text_file.cmake)
+set(FFX_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
+file(MAKE_DIRECTORY ${FFX_GEN_DIR})
+embed_text_file(${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx/ffx_a.h    ${FFX_GEN_DIR}/ffx_a_embedded.h    g_ffx_a_h)
+embed_text_file(${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx/ffx_fsr1.h ${FFX_GEN_DIR}/ffx_fsr1_embedded.h g_ffx_fsr1_h)
+
+target_include_directories(fsr_proxy PRIVATE src third_party/ffx ${FFX_GEN_DIR})
 target_compile_definitions(fsr_proxy PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(fsr_proxy PRIVATE minhook imgui d3d11 d3d12 dxgi dxguid dwmapi d3dcompiler)
 
