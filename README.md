@@ -4,6 +4,15 @@ FSR Injector Experimental is a DXGI proxy / graphics-injection project for addin
 
 This project is currently experimental. It is not a production-quality FSR3 replacement yet, but it now has a working DX12 pipeline for image processing, generated-frame presentation experiments, and generic resource scouting.
 
+> [!WARNING]
+> **Do not use this in online / multiplayer games protected by anti-cheat.**
+> A proxy `dxgi.dll` placed next to a game executable is exactly the pattern that
+> Easy Anti-Cheat, BattlEye, Vanguard, and similar systems detect, and it can
+> result in a **permanent account ban**. Use this only in single-player games.
+> You use this software entirely at your own risk.
+
+This project is licensed under the [MIT License](LICENSE).
+
 ## Current Status
 
 ### Working DX12 features
@@ -46,13 +55,28 @@ Current test controls are temporary and will eventually be replaced by a proper 
 - `F5` = experimental generated-frame presentation.
 - `F6` = experimental scout motion-vector candidate usage.
 
-## Runtime environment options
+## Configuration
+
+The injector reads settings from a `fsrinj.ini` file placed next to `dxgi.dll`
+(see [`fsrinj.ini.example`](fsrinj.ini.example) for every key with comments).
+Every key can also be set as an environment variable with the same name, and
+environment variables take priority over the INI.
+
+Commonly used keys:
 
 - `FSRINJ_DX12_SHARPEN=0` disables the DX12 post-process path.
 - `FSRINJ_DX12_SHARPNESS=<value>` sets startup sharpness.
 - `FSRINJ_DX12_SCALE=<value>` sets startup internal scale.
 - `FSRINJ_DX12_GENPRESENT=1` enables experimental generated-frame presentation at startup.
 - `FSRINJ_DX12_SCOUT_MV=1` enables experimental scout motion-vector candidate usage at startup.
+- `FSRINJ_KEY_MENU=0x24` rebinds the menu toggle key (virtual-key code).
+
+Note: on games using a frame-latency waitable swapchain, generated-frame
+presentation is automatically disabled for compatibility (the injector logs
+this) -- upscaling/sharpening still works.
+
+The log file is written next to `dxgi.dll`, or to
+`%LOCALAPPDATA%\fsr-injector\<game>.log` when the game folder is not writable.
 
 ## What this project can do now
 
@@ -99,7 +123,11 @@ The scout path is still heuristic. It should be treated as a discovery/debugging
 
 ## Building
 
-Use GitHub Actions on a Windows runner. The repo includes workflow files under `.github/workflows/`. After the build completes, download the `dxgi.dll` artifact and place it next to the target game executable.
+Use GitHub Actions on a Windows runner. The repo includes workflow files under `.github/workflows/`. After the build completes, download the build artifact (it contains `dxgi.dll`, the matching `dxgi.pdb` for crash debugging, and `fsrinj.ini.example`) and place `dxgi.dll` next to the target game executable.
+
+Tagged releases: pushing a tag like `v0.3.0` runs the release workflow, which publishes a zip of the same files on the GitHub Releases page.
+
+Local builds also work with Visual Studio 2022 / CMake 3.26+ (`cmake -S . -B build -A x64 && cmake --build build --config Release`) and with MinGW-w64 cross-compilation.
 
 ## Current Experimental Scout-MV Test Flow
 

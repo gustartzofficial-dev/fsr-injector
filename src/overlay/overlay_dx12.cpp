@@ -2,6 +2,7 @@
 #include "hooks/dx12_queue_capture.h"
 #include "core/config.h"
 #include "core/log.h"
+#include "core/settings.h"
 #include "capture/generic_resource_scout.h"
 
 #include <windows.h>
@@ -69,6 +70,14 @@ namespace {
     HWND g_hwnd = nullptr;
     bool g_effect_allowed = true;
     bool g_effect_enabled = true;
+    // Set when a fence wait times out AND the device reports removal (TDR, crash,
+    // driver reset). From then on the injector goes fully passive: recording more
+    // GPU work on a removed device would take the game down with us.
+    bool g_device_lost = false;
+    // False on swapchains created with DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.
+    // Those games budget exactly one Present per latency-object wait; our extra
+    // generated-frame Present consumes a latency slot every frame and stalls them.
+    bool g_gen_present_allowed = true;
     bool g_menu_visible = true;
     bool g_logged_first_effect = false;
     bool g_history_ready = false;
@@ -115,31 +124,36 @@ namespace {
         if (p) { p->Release(); p = nullptr; }
     }
 
+    // These now resolve through core::settings: env var first (unchanged
+    // behavior), then fsrinj.ini next to the DLL, then the fallback.
     bool env_disabled(const wchar_t* name) {
-        wchar_t value[16]{};
-        DWORD n = GetEnvironmentVariableW(name, value, 16);
-        if (n == 0 || n >= 16) return false;
-        return value[0] == L'0' || value[0] == L'n' || value[0] == L'N' ||
-               value[0] == L'f' || value[0] == L'F';
+        return core::settings::has(name) && !core::settings::get_bool(name, true);
+    }
+
+    bool opt_bool(const wchar_t* name, bool fallback) {
+        return core::settings::get_bool(name, fallback);
     }
 
     float env_float(const wchar_t* name, float fallback) {
-        wchar_t value[64]{};
-        DWORD n = GetEnvironmentVariableW(name, value, 64);
-        if (n == 0 || n >= 64) return fallback;
-        wchar_t* end = nullptr;
-        float parsed = std::wcstof(value, &end);
-        if (end == value) return fallback;
-        if (parsed < 0.0f) parsed = 0.0f;
-        if (parsed > 1.0f) parsed = 1.0f;
-        return parsed;
+        return core::settings::get_float(name, fallback, 0.0f, 1.0f);
     }
 
     float env_scale(const wchar_t* name, float fallback) {
-        float parsed = env_float(name, fallback);
-        if (parsed < 0.50f) parsed = 0.50f;
-        if (parsed > 1.00f) parsed = 1.00f;
-        return parsed;
+        return core::settings::get_float(name, fallback, 0.50f, 1.00f);
+    }
+
+    // Hotkey edge detection. GetAsyncKeyState's 0x0001 "pressed since last call"
+    // bit is shared system-wide and unreliable; we track edges on the 0x8000 bit
+    // ourselves. State always updates (so refocusing doesn't replay a stale edge),
+    // but the press only *fires* while the game window is foreground -- otherwise
+    // typing in Discord with the game in the background toggles injector features.
+    bool key_edge(int vk) {
+        static bool prev[256] = {};
+        if (vk <= 0 || vk >= 256) return false;
+        const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        const bool fired = down && !prev[vk];
+        prev[vk] = down;
+        return fired;
     }
 
     void update_fps_counters(unsigned generated_samples) {
@@ -183,7 +197,23 @@ namespace {
             LOGF("[overlay-dx12] SetEventOnCompletion failed hr=0x%08lX", hr);
             return false;
         }
-        WaitForSingleObject(g_fence_event, 2000);
+        const DWORD wait = WaitForSingleObject(g_fence_event, 2000);
+        if (wait == WAIT_TIMEOUT && g_fence->GetCompletedValue() < value) {
+            // A 2s GPU stall usually means TDR/device removal. Previously we fell
+            // through and Reset() in-flight allocators, which turns a recoverable
+            // hiccup into DXGI_ERROR_DEVICE_REMOVED for the *game*. Instead:
+            // diagnose, and if the device is gone, permanently go passive.
+            HRESULT reason = g_dev ? g_dev->GetDeviceRemovedReason() : S_OK;
+            LOGF("[overlay-dx12] fence wait timed out (value=%llu completed=%llu) removedReason=0x%08lX",
+                 (unsigned long long)value, (unsigned long long)g_fence->GetCompletedValue(), reason);
+            if (reason != S_OK && !g_device_lost) {
+                g_device_lost = true;
+                g_effect_enabled = false;
+                g_generated_present_enabled = false;
+                LOGF("[overlay-dx12] device removed; injector disabled for the rest of the session");
+            }
+            return false;
+        }
         return g_fence->GetCompletedValue() >= value;
     }
 
@@ -962,6 +992,14 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         DXGI_SWAP_CHAIN_DESC desc{};
         sc->GetDesc(&desc);
         g_hwnd = desc.OutputWindow;
+
+        // Waitable swapchains budget exactly one Present per frame-latency wait.
+        // Presenting an extra generated frame consumes their latency slots and
+        // stalls the game, so generated-present is disabled on those chains.
+        g_gen_present_allowed = (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) == 0;
+        if (!g_gen_present_allowed)
+            LOGF("[overlay-dx12] swapchain uses a frame-latency waitable object; generated-frame presentation disabled for compatibility");
+
         g_effect_allowed = !env_disabled(L"FSRINJ_DX12_SHARPEN");
         g_effect_enabled = g_effect_allowed;
         g_menu_visible = core::config().overlay_visible.load();
@@ -969,10 +1007,10 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         if (g_sharpness <= 0.0f) g_sharpness = 0.20f;
         if (g_sharpness > 1.0f) g_sharpness = 1.0f;
         g_scale = env_scale(L"FSRINJ_DX12_SCALE", 0.77f);
-        g_interpolation_enabled = !env_disabled(L"FSRINJ_DX12_INTERP") && env_float(L"FSRINJ_DX12_INTERP", 0.0f) > 0.5f;
-        g_generated_present_enabled = !env_disabled(L"FSRINJ_DX12_GENPRESENT") && env_float(L"FSRINJ_DX12_GENPRESENT", 0.0f) > 0.5f;
-        g_scout_motion_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV") && env_float(L"FSRINJ_DX12_SCOUT_MV", 0.0f) > 0.5f;
-        g_scout_motion_use_enabled = !env_disabled(L"FSRINJ_DX12_SCOUT_MV_USE") && env_float(L"FSRINJ_DX12_SCOUT_MV_USE", 0.0f) > 0.5f;
+        g_interpolation_enabled = opt_bool(L"FSRINJ_DX12_INTERP", false);
+        g_generated_present_enabled = g_gen_present_allowed && opt_bool(L"FSRINJ_DX12_GENPRESENT", false);
+        g_scout_motion_enabled = opt_bool(L"FSRINJ_DX12_SCOUT_MV", false);
+        g_scout_motion_use_enabled = opt_bool(L"FSRINJ_DX12_SCOUT_MV_USE", false);
         g_pacing_enabled = !env_disabled(L"FSRINJ_DX12_PACING");
         g_use_imgui = !env_disabled(L"FSRINJ_DX12_IMGUI");
         g_pace_fraction = (double)env_float(L"FSRINJ_DX12_PACE_FRACTION", 0.5f);
@@ -1298,7 +1336,12 @@ float4 EasuRcasPS(VSOut i) : SV_Target {
         ImGui::SliderFloat("Sharpness", &g_sharpness, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Render scale", &g_scale, 0.50f, 1.0f, "%.2f");
         ImGui::Separator();
-        ImGui::Checkbox("Frame generation  (F5)", &g_generated_present_enabled);
+        if (g_gen_present_allowed) {
+            ImGui::Checkbox("Frame generation  (F5)", &g_generated_present_enabled);
+        } else {
+            g_generated_present_enabled = false;
+            ImGui::TextDisabled("Frame generation: unavailable (waitable swapchain)");
+        }
         ImGui::Checkbox("Motion interpolation preview  (F4)", &g_interpolation_enabled);
         ImGui::TextDisabled(g_history_ready ? "History: ready" : "History: warming up");
         ImGui::Separator();
@@ -1483,6 +1526,7 @@ void handle_mouse_controls() {
 }
 
 bool on_present(IDXGISwapChain* sc) {
+    if (g_device_lost) return true; // fully passive after device removal
     if (!g_init) {
         if (!init(sc)) return false;
         g_init = true;
@@ -1502,7 +1546,10 @@ bool on_present(IDXGISwapChain* sc) {
     bool recreate_scale_resources = false;
     auto clamp01 = [](float v) -> float { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
     auto clamp_scale = [](float v) -> float { return v < 0.50f ? 0.50f : (v > 1.00f ? 1.00f : v); };
-    auto pressed = [](int vk) -> bool { return (GetAsyncKeyState(vk) & 0x0001) != 0; };
+    // Only act on hotkeys while the game window has focus. Edge state still
+    // updates while unfocused (inside key_edge) so refocusing can't replay keys.
+    const bool win_focused = !g_hwnd || GetForegroundWindow() == g_hwnd;
+    auto pressed = [&](int vk) -> bool { const bool e = key_edge(vk); return win_focused && e; };
 
     if (pressed(core::config().toggle_key.load())) {
         g_menu_visible = !g_menu_visible;
@@ -1541,7 +1588,14 @@ bool on_present(IDXGISwapChain* sc) {
     if (pressed(VK_F2)) { g_scale = 0.67f; g_sharpness = 0.45f; recreate_scale_resources = true; LOGF("[overlay-dx12] F2 preset: Balanced scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
     if (pressed(VK_F3)) { g_scale = 0.59f; g_sharpness = 0.55f; recreate_scale_resources = true; LOGF("[overlay-dx12] F3 preset: Performance scale=%.2f sharpness=%.2f", g_scale, g_sharpness); }
     if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
-    if (pressed(VK_F5)) { g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0; LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
+    if (pressed(VK_F5)) {
+        if (!g_gen_present_allowed) {
+            LOGF("[overlay-dx12] F5 ignored: waitable swapchain; generated-frame presentation unavailable in this game");
+        } else {
+            g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0;
+            LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
+        }
+    }
     if (pressed(VK_F6)) {
         g_scout_motion_enabled = !g_scout_motion_enabled;
         g_scout_motion_use_enabled = false;
@@ -1649,6 +1703,7 @@ void on_after_resize(IDXGISwapChain* sc) {
 
 namespace {
     bool submit_generated_to_current_backbuffer(IDXGISwapChain* sc) {
+        if (g_device_lost || !g_gen_present_allowed) return false;
         if (!g_init || !g_sc3 || !g_generated_present_enabled || !g_generated_ready || !g_generated || g_inside_generated_present) return false;
         if (!g_cmd || !g_queue || g_frames.empty()) return false;
         const UINT idx = g_sc3->GetCurrentBackBufferIndex();

@@ -292,6 +292,7 @@ ID3D12CommandQueue* queue_for_swapchain(IDXGISwapChain* sc) {
 }
 
 void shutdown() {
+    capture::scout::reset_dx12_resources();
     std::lock_guard<std::mutex> lk(g_mtx);
     for (auto& kv : g_queues) if (kv.second) kv.second->Release();
     g_queues.clear();

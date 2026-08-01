@@ -14,7 +14,9 @@ include(FetchContent)
 FetchContent_Declare(
     minhook
     GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG        master
+    # Pinned for reproducible builds ('master' can break silently, exactly as the
+    # unpinned ImGui DX12 backend did before it was pinned to v1.90.9 below).
+    GIT_TAG        v1.3.4
 )
 FetchContent_MakeAvailable(minhook)
 
@@ -69,6 +71,7 @@ add_library(fsr_proxy SHARED
     src/fsr/framegen.cpp
     src/fsr/upscaler.cpp
     src/core/log.cpp
+    src/core/settings.cpp
 )
 
 target_include_directories(fsr_proxy PRIVATE src)
@@ -77,3 +80,10 @@ target_link_libraries(fsr_proxy PRIVATE minhook imgui d3d11 d3d12 dxgi dxguid dw
 
 # Name the output exactly "dxgi.dll" with no "lib" prefix.
 set_target_properties(fsr_proxy PROPERTIES PREFIX "" OUTPUT_NAME "dxgi")
+
+# MSVC: emit a PDB even for Release so user crash dumps can be symbolized.
+# (/OPT:REF /OPT:ICF keep the binary as small as a normal Release link.)
+if(MSVC)
+    target_compile_options(fsr_proxy PRIVATE /Zi)
+    target_link_options(fsr_proxy PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+endif()

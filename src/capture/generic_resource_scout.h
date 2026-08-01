@@ -70,6 +70,11 @@ void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_ha
 // Caller must Release(). This is experimental and may be a false positive.
 bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORMAT* out_format, unsigned* out_width, unsigned* out_height, D3D12_RESOURCE_STATES* out_state, bool* out_state_known);
 
+// Drop all cached descriptor entries and their resource references. Called on
+// ResizeBuffers (render targets are recreated then) and at shutdown so the
+// scout never outlives the resources it is tracking.
+void reset_dx12_resources();
+
 Snapshot snapshot();
 void log_snapshot_once();
 void log_dx12_candidates_periodic();

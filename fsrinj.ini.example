@@ -1,0 +1,37 @@
+# fsr-injector configuration
+# --------------------------
+# Copy this file to "fsrinj.ini" and place it NEXT TO the injector's dxgi.dll
+# (i.e. in the game folder). Every key can also be set as an environment
+# variable with the same name; environment variables take priority over
+# this file. Lines starting with # or ; are comments.
+#
+# Booleans accept: 1/0, true/false, yes/no, on/off.
+
+[general]
+# Menu toggle key as a virtual-key code (0x24 = Home). Accepts hex or decimal.
+# See https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes
+FSRINJ_KEY_MENU = 0x24
+
+# Default sharpness used by the DX11 path and as the DX12 fallback (0.0 - 1.0).
+FSRINJ_SHARPNESS = 0.5
+
+[dx12]
+# Master switch for the DX12 post-process (sharpen/upscale) path.
+FSRINJ_DX12_SHARPEN = 1
+
+# Startup sharpness (0.0 - 1.0) and internal render scale (0.50 - 1.00).
+FSRINJ_DX12_SHARPNESS = 0.20
+FSRINJ_DX12_SCALE = 0.77
+
+# Experimental features (all default off / safe values).
+FSRINJ_DX12_INTERP = 0          ; F4 motion-interpolation preview at startup
+FSRINJ_DX12_GENPRESENT = 0      ; F5 generated-frame presentation at startup
+FSRINJ_DX12_SCOUT_MV = 0        ; F6 scout motion-vector validation at startup
+FSRINJ_DX12_SCOUT_MV_USE = 0    ; F7 use of the copied MV candidate at startup
+FSRINJ_DX12_PACING = 1          ; pace generated frames toward the midpoint
+FSRINJ_DX12_PACE_FRACTION = 0.5 ; 0.1 - 0.9, where between real frames to land
+FSRINJ_DX12_IMGUI = 1           ; 0 forces the legacy hand-drawn menu
+
+[dx11]
+FSRINJ_DX11_PACING = 1          ; generated-frame pacing on the DX11 path
+FSRINJ_DX11_MENU_IN_GEN = 1     ; draw the menu into generated frames (no flicker)

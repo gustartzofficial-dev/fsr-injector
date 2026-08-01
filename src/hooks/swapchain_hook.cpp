@@ -2,6 +2,7 @@
 #include "overlay/overlay.h"
 #include "fsr/framegen.h"
 #include "fsr/upscaler.h"
+#include "capture/generic_resource_scout.h"
 #include "core/log.h"
 #include "core/config.h"
 
@@ -34,6 +35,10 @@ static bool is_d3d11_swapchain(IDXGISwapChain* sc) {
 
 // Classic present path (DISCARD / older games).
 static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT flags) {
+    // DXGI_PRESENT_TEST is an occlusion probe: no frame is actually presented,
+    // so running the sharpen/framegen/overlay pipeline here would mutate the
+    // backbuffer for nothing (and confuse frame pacing). Pass it through untouched.
+    if (flags & DXGI_PRESENT_TEST) return g_orig_present(sc, sync, flags);
     const bool d3d11 = is_d3d11_swapchain(sc);
     if (d3d11) {
         upscaler::sharpen(sc);
@@ -57,14 +62,18 @@ static HRESULT STDMETHODCALLTYPE hk_Present(IDXGISwapChain* sc, UINT sync, UINT 
 // Flip-model present path (most modern D3D11 games).
 static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                              const DXGI_PRESENT_PARAMETERS* pp) {
+    if (flags & DXGI_PRESENT_TEST) return g_orig_present1(sc, sync, flags, pp);
     const bool d3d11 = is_d3d11_swapchain(sc);
     if (d3d11) {
         upscaler::sharpen(sc);
+        // NOTE: framegen presents its extra frame through the *Present* trampoline
+        // even on the Present1 path (same object, both entry points valid). Guard
+        // against the theoretical case where only Present1 got hooked.
         if (core::config().dx11_overlay_in_generated.load()) {
             overlay::on_present(sc);
-            framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+            if (g_orig_present) framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
         } else {
-            framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
+            if (g_orig_present) framegen::before_present(sc, reinterpret_cast<framegen::PresentTrampoline>(g_orig_present), flags);
             overlay::on_present(sc);
         }
     } else {
@@ -78,6 +87,9 @@ static HRESULT STDMETHODCALLTYPE hk_Present1(IDXGISwapChain1* sc, UINT sync, UIN
 static HRESULT STDMETHODCALLTYPE hk_ResizeBuffers(IDXGISwapChain* sc, UINT count, UINT w,
                                                   UINT h, DXGI_FORMAT fmt, UINT flags) {
     overlay::on_resize_buffers();
+    // Resolution changes recreate most render targets; drop the scout's cached
+    // resource references so it re-discovers instead of holding dead candidates.
+    capture::scout::reset_dx12_resources();
     HRESULT hr = g_orig_resize(sc, count, w, h, fmt, flags);
     overlay::on_after_resize(sc);
     return hr;

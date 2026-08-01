@@ -2,6 +2,7 @@
 #include "hooks/depth_hook.h"
 #include "core/log.h"
 
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 #include <algorithm>
@@ -19,16 +20,49 @@ namespace {
         bool depth_candidate = false;
         bool motion_candidate = false;
         unsigned bind_count = 0;
-        ID3D12Resource* resource = nullptr; // raw pointer; AddRef only during acquire.
-        bool state_known = false;
-        D3D12_RESOURCE_STATES last_state = D3D12_RESOURCE_STATE_COMMON;
+        uint64_t seq = 0;                       // insertion order, for eviction
+        // STRONG reference (AddRef'd on store, Release'd on overwrite/evict/reset).
+        // The previous raw pointer was a use-after-free: games destroy and recreate
+        // render targets constantly, and AddRef on a freed COM pointer is itself
+        // the crash. Holding a real ref trades a bounded amount of VRAM lifetime
+        // extension (capped by kMaxDescriptors + the ResizeBuffers reset) for
+        // guaranteed pointer validity.
+        ID3D12Resource* resource = nullptr;
     };
 
+    // ---- hot-path counters -------------------------------------------------
+    // These are bumped from inside DrawInstanced / SetPipelineState / etc. hooks,
+    // i.e. tens of thousands of times per frame from multiple render threads.
+    // They MUST NOT take a lock: a shared mutex here serializes the game's entire
+    // command-recording thread pool and measurably costs FPS. Relaxed atomics are
+    // exact enough for diagnostics and effectively free.
+    std::atomic<unsigned> g_command_lists_seen{0};
+    std::atomic<unsigned> g_execute_calls{0};
+    std::atomic<unsigned> g_draw_calls{0};
+    std::atomic<unsigned> g_resource_barriers{0};
+    std::atomic<unsigned> g_pso_sets{0};
+    std::atomic<unsigned> g_root_table_sets{0};
+    std::atomic<unsigned> g_rtv_descriptors{0};
+    std::atomic<unsigned> g_dsv_descriptors{0};
+    std::atomic<unsigned> g_om_rt_binds{0};
+    std::atomic<unsigned> g_om_depth_binds{0};
+    std::atomic<unsigned> g_depth_candidates{0};
+    std::atomic<unsigned> g_motion_candidates{0};
+
+    // ---- cold state (mutex-protected) --------------------------------------
     std::mutex g_mtx;
-    Snapshot g_state{};
+    Snapshot g_state{};                 // only the non-counter fields are used
     bool g_logged = false;
-    unsigned g_periodic_log_count = 0;
+    std::atomic<unsigned> g_periodic_log_count{0};
+    uint64_t g_next_seq = 1;
     std::unordered_map<SIZE_T, DescriptorInfo> g_descriptors;
+    // Secondary index: last known state per resource, updated by the barrier
+    // hook in O(barrier count) instead of the old O(barriers x descriptors)
+    // scan (which also ran under the lock on a hot path).
+    std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> g_resource_states;
+
+    constexpr size_t kMaxDescriptors = 4096;
+    constexpr size_t kMaxResourceStates = 8192;
 
     // Set only while the injector is recording its own overlay/ImGui commands on
     // this thread. Lets the hooks below skip our own work (and ImGui's internal
@@ -113,6 +147,38 @@ namespace {
             }
         }
     }
+
+    void release_descriptor_locked(DescriptorInfo& info) {
+        if (info.resource) { info.resource->Release(); info.resource = nullptr; }
+    }
+
+    // Insert/overwrite a descriptor entry, managing the resource references and
+    // keeping the map bounded. Caller passes info with resource ALREADY AddRef'd.
+    void store_descriptor_locked(SIZE_T handle, DescriptorInfo&& info) {
+        auto it = g_descriptors.find(handle);
+        if (it != g_descriptors.end()) {
+            release_descriptor_locked(it->second);   // descriptor slot reused: drop old ref
+            it->second = std::move(info);
+            return;
+        }
+        if (g_descriptors.size() >= kMaxDescriptors) {
+            // Evict the oldest non-candidate entry (or the overall oldest if all
+            // are candidates) so tracking can't grow without bound in games that
+            // churn descriptor heaps.
+            auto victim = g_descriptors.end();
+            uint64_t best_seq = UINT64_MAX;
+            for (auto v = g_descriptors.begin(); v != g_descriptors.end(); ++v) {
+                const bool cand = v->second.depth_candidate || v->second.motion_candidate;
+                const uint64_t score = v->second.seq + (cand ? (UINT64_MAX / 2) : 0);
+                if (score < best_seq) { best_seq = score; victim = v; }
+            }
+            if (victim != g_descriptors.end()) {
+                release_descriptor_locked(victim->second);
+                g_descriptors.erase(victim);
+            }
+        }
+        g_descriptors.emplace(handle, std::move(info));
+    }
 }
 
 void set_enabled(bool enabled) { std::lock_guard<std::mutex> lk(g_mtx); g_state.enabled = enabled; }
@@ -129,29 +195,31 @@ void note_dx12_swapchain(unsigned width, unsigned height, DXGI_FORMAT format) {
 
 void note_dx12_history(bool ready) { std::lock_guard<std::mutex> lk(g_mtx); g_state.dx12_history_ready = ready; }
 void note_final_frame_motion(bool available) { std::lock_guard<std::mutex> lk(g_mtx); g_state.final_frame_motion = available; }
-void note_dx12_command_list_seen() { std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_command_lists_seen; }
-void note_dx12_execute_call(unsigned command_list_count) { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_execute_calls; g_state.dx12_command_lists_seen += command_list_count; }
-void note_dx12_draw_call(bool) { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_draw_calls; }
+
+// Hot path: lock-free.
+void note_dx12_command_list_seen() { g_command_lists_seen.fetch_add(1, std::memory_order_relaxed); }
+void note_dx12_execute_call(unsigned command_list_count) {
+    if (g_overlay_active) return;
+    g_execute_calls.fetch_add(1, std::memory_order_relaxed);
+    g_command_lists_seen.fetch_add(command_list_count, std::memory_order_relaxed);
+}
+void note_dx12_draw_call(bool) { if (g_overlay_active) return; g_draw_calls.fetch_add(1, std::memory_order_relaxed); }
+void note_dx12_set_pipeline_state() { if (g_overlay_active) return; g_pso_sets.fetch_add(1, std::memory_order_relaxed); }
+void note_dx12_set_graphics_root_descriptor_table() { if (g_overlay_active) return; g_root_table_sets.fetch_add(1, std::memory_order_relaxed); }
+
 void note_dx12_resource_barrier(unsigned count, const D3D12_RESOURCE_BARRIER* barriers) {
     if (g_overlay_active) return;
-    std::lock_guard<std::mutex> lk(g_mtx);
-    g_state.dx12_resource_barriers += count;
+    g_resource_barriers.fetch_add(count, std::memory_order_relaxed);
     if (!barriers) return;
+    // Only transition barriers on resources matter; the map update is O(count).
+    std::lock_guard<std::mutex> lk(g_mtx);
     for (unsigned i = 0; i < count; ++i) {
         const D3D12_RESOURCE_BARRIER& b = barriers[i];
         if (b.Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || !b.Transition.pResource) continue;
-        ID3D12Resource* res = b.Transition.pResource;
-        for (auto& kv : g_descriptors) {
-            DescriptorInfo& info = kv.second;
-            if (info.resource == res) {
-                info.state_known = true;
-                info.last_state = b.Transition.StateAfter;
-            }
-        }
+        if (g_resource_states.size() >= kMaxResourceStates) g_resource_states.clear(); // stale keys are harmless; bound memory
+        g_resource_states[b.Transition.pResource] = b.Transition.StateAfter;
     }
 }
-void note_dx12_set_pipeline_state() { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_pso_sets; }
-void note_dx12_set_graphics_root_descriptor_table() { if (g_overlay_active) return; std::lock_guard<std::mutex> lk(g_mtx); ++g_state.dx12_root_table_sets; }
 
 void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc) {
     if (!resource || !handle.ptr) return;
@@ -163,14 +231,16 @@ void note_dx12_rtv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource
     info.height = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? static_cast<unsigned>(rd.DepthOrArraySize) : rd.Height;
     info.resource_format = rd.Format;
     info.view_format = desc ? desc->Format : rd.Format;
+    resource->AddRef();
     info.resource = resource;
-    info.motion_candidate = near_swap_size(info.width, info.height) && is_motion_like_format(info.view_format != DXGI_FORMAT_UNKNOWN ? info.view_format : info.resource_format);
 
     std::lock_guard<std::mutex> lk(g_mtx);
-    g_descriptors[handle.ptr] = info;
-    ++g_state.dx12_rtv_descriptors;
-    if (info.motion_candidate) ++g_state.dx12_motion_candidates;
+    info.seq = g_next_seq++;
+    info.motion_candidate = near_swap_size(info.width, info.height) && is_motion_like_format(info.view_format != DXGI_FORMAT_UNKNOWN ? info.view_format : info.resource_format);
+    g_rtv_descriptors.fetch_add(1, std::memory_order_relaxed);
+    if (info.motion_candidate) g_motion_candidates.fetch_add(1, std::memory_order_relaxed);
     update_best_locked(info);
+    store_descriptor_locked(handle.ptr, std::move(info));
 }
 
 void note_dx12_dsv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc) {
@@ -183,22 +253,24 @@ void note_dx12_dsv_descriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, ID3D12Resource
     info.height = rd.Height;
     info.resource_format = rd.Format;
     info.view_format = desc ? desc->Format : rd.Format;
+    resource->AddRef();
     info.resource = resource;
-    info.depth_candidate = near_swap_size(info.width, info.height) && (is_depth_format(info.view_format) || is_depth_format(info.resource_format));
 
     std::lock_guard<std::mutex> lk(g_mtx);
-    g_descriptors[handle.ptr] = info;
-    ++g_state.dx12_dsv_descriptors;
-    if (info.depth_candidate) ++g_state.dx12_depth_candidates;
+    info.seq = g_next_seq++;
+    info.depth_candidate = near_swap_size(info.width, info.height) && (is_depth_format(info.view_format) || is_depth_format(info.resource_format));
+    g_dsv_descriptors.fetch_add(1, std::memory_order_relaxed);
+    if (info.depth_candidate) g_depth_candidates.fetch_add(1, std::memory_order_relaxed);
     update_best_locked(info);
+    store_descriptor_locked(handle.ptr, std::move(info));
 }
 
 void note_dx12_omset(unsigned rt_count, const D3D12_CPU_DESCRIPTOR_HANDLE* rt_handles, const D3D12_CPU_DESCRIPTOR_HANDLE* dsv_handle) {
     if (g_overlay_active) return;
+    g_om_rt_binds.fetch_add(rt_count, std::memory_order_relaxed);
+    if (dsv_handle && dsv_handle->ptr) g_om_depth_binds.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(g_mtx);
-    g_state.dx12_om_rt_binds += rt_count;
     if (dsv_handle && dsv_handle->ptr) {
-        ++g_state.dx12_om_depth_binds;
         auto it = g_descriptors.find(dsv_handle->ptr);
         if (it != g_descriptors.end()) { ++it->second.bind_count; it->second.depth_candidate = true; update_best_locked(it->second); }
     }
@@ -218,32 +290,65 @@ bool acquire_dx12_best_motion_candidate(ID3D12Resource** out_resource, DXGI_FORM
     if (out_state) *out_state = D3D12_RESOURCE_STATE_COMMON;
     if (out_state_known) *out_state_known = false;
     std::lock_guard<std::mutex> lk(g_mtx);
-    ID3D12Resource* best = nullptr;
-    DescriptorInfo best_info{};
+    const DescriptorInfo* best = nullptr;
     for (const auto& kv : g_descriptors) {
         const DescriptorInfo& info = kv.second;
         if (!info.motion_candidate || !info.resource) continue;
-        if (!best || (info.bind_count > best_info.bind_count) ||
-            (info.bind_count == best_info.bind_count && info.width * info.height >= best_info.width * best_info.height)) {
-            best = info.resource;
-            best_info = info;
+        if (!best || (info.bind_count > best->bind_count) ||
+            (info.bind_count == best->bind_count && info.width * info.height >= best->width * best->height)) {
+            best = &info;
         }
     }
     if (!best) return false;
-    best->AddRef();
-    if (out_resource) *out_resource = best;
-    else best->Release();
-    if (out_format) *out_format = best_info.view_format != DXGI_FORMAT_UNKNOWN ? best_info.view_format : best_info.resource_format;
-    if (out_width) *out_width = best_info.width;
-    if (out_height) *out_height = best_info.height;
-    if (out_state) *out_state = best_info.last_state;
-    if (out_state_known) *out_state_known = best_info.state_known;
+    // The map holds a strong ref, so this AddRef is on a guaranteed-live object
+    // (the whole point of the strong-ref change).
+    best->resource->AddRef();
+    if (out_resource) *out_resource = best->resource;
+    else best->resource->Release();
+    if (out_format) *out_format = best->view_format != DXGI_FORMAT_UNKNOWN ? best->view_format : best->resource_format;
+    if (out_width) *out_width = best->width;
+    if (out_height) *out_height = best->height;
+    auto st = g_resource_states.find(best->resource);
+    if (st != g_resource_states.end()) {
+        if (out_state) *out_state = st->second;
+        if (out_state_known) *out_state_known = true;
+    }
     return true;
 }
 
-Snapshot snapshot() {
+void reset_dx12_resources() {
     std::lock_guard<std::mutex> lk(g_mtx);
-    Snapshot out = g_state;
+    for (auto& kv : g_descriptors) release_descriptor_locked(kv.second);
+    g_descriptors.clear();
+    g_resource_states.clear();
+    g_state.dx12_best_depth_width = 0;
+    g_state.dx12_best_depth_height = 0;
+    g_state.dx12_best_depth_format = DXGI_FORMAT_UNKNOWN;
+    g_state.dx12_best_motion_width = 0;
+    g_state.dx12_best_motion_height = 0;
+    g_state.dx12_best_motion_format = DXGI_FORMAT_UNKNOWN;
+    g_state.dx12_best_motion_resource_available = false;
+    LOGF("[scout] dx12 resource cache reset");
+}
+
+Snapshot snapshot() {
+    Snapshot out;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        out = g_state;
+    }
+    out.dx12_command_lists_seen = g_command_lists_seen.load(std::memory_order_relaxed);
+    out.dx12_execute_calls = g_execute_calls.load(std::memory_order_relaxed);
+    out.dx12_draw_calls = g_draw_calls.load(std::memory_order_relaxed);
+    out.dx12_resource_barriers = g_resource_barriers.load(std::memory_order_relaxed);
+    out.dx12_pso_sets = g_pso_sets.load(std::memory_order_relaxed);
+    out.dx12_root_table_sets = g_root_table_sets.load(std::memory_order_relaxed);
+    out.dx12_rtv_descriptors = g_rtv_descriptors.load(std::memory_order_relaxed);
+    out.dx12_dsv_descriptors = g_dsv_descriptors.load(std::memory_order_relaxed);
+    out.dx12_om_rt_binds = g_om_rt_binds.load(std::memory_order_relaxed);
+    out.dx12_om_depth_binds = g_om_depth_binds.load(std::memory_order_relaxed);
+    out.dx12_depth_candidates = g_depth_candidates.load(std::memory_order_relaxed);
+    out.dx12_motion_candidates = g_motion_candidates.load(std::memory_order_relaxed);
     out.dx11_depth_found = depth::found();
     out.dx11_depth_readable = depth::readable();
     out.dx11_depth_width = depth::width();
@@ -254,8 +359,11 @@ Snapshot snapshot() {
 
 void log_snapshot_once() {
     Snapshot s = snapshot();
-    if (g_logged) return;
-    g_logged = true;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        if (g_logged) return;
+        g_logged = true;
+    }
     LOGF("[scout] generic resource scout active: api=%s dx12=%ux%u fmt=%u motion=%s dx11_depth=%s %ux%u fmt=%s readable=%s",
          s.api == ApiKind::DX12 ? "dx12" : (s.api == ApiKind::DX11 ? "dx11" : "unknown"),
          s.dx12_width, s.dx12_height, (unsigned)s.dx12_format,
@@ -266,8 +374,10 @@ void log_snapshot_once() {
 }
 
 void log_dx12_candidates_periodic() {
+    // Lock-free counter gate first: this is called from ExecuteCommandLists,
+    // so the common case (not this tick) must stay cheap.
+    if ((g_periodic_log_count.fetch_add(1, std::memory_order_relaxed) + 1) % 600 != 0) return;
     Snapshot s = snapshot();
-    if ((++g_periodic_log_count % 600) != 0) return;
     LOGF("[scout-dx12] cmdlists=%u exec=%u draws=%u barriers=%u pso=%u rootTbl=%u rtv=%u dsv=%u omrt=%u omdsv=%u depthCand=%u bestDepth=%ux%u %s mvCand=%u bestMV=%ux%u %s",
          s.dx12_command_lists_seen, s.dx12_execute_calls, s.dx12_draw_calls, s.dx12_resource_barriers, s.dx12_pso_sets, s.dx12_root_table_sets,
          s.dx12_rtv_descriptors, s.dx12_dsv_descriptors, s.dx12_om_rt_binds, s.dx12_om_depth_binds,

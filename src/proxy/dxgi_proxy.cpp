@@ -1,5 +1,6 @@
 #include "proxy/dxgi_proxy.h"
 #include "core/log.h"
+#include <mutex>
 
 namespace proxy {
 
@@ -10,8 +11,11 @@ FARPROC p_DXGIGetDebugInterface1          = nullptr;
 FARPROC p_DXGIDeclareAdapterRemovalSupport= nullptr;
 
 static HMODULE g_real = nullptr;
+static std::mutex g_load_mtx;
 
 bool load_real_dxgi() {
+    std::lock_guard<std::mutex> lk(g_load_mtx);
+    if (g_real) return true; // already resolved (lazy retry path)
     wchar_t sys[MAX_PATH];
     GetSystemDirectoryW(sys, MAX_PATH);
     std::wstring path = std::wstring(sys) + L"\\dxgi.dll";
