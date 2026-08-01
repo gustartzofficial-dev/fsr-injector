@@ -26,6 +26,7 @@ FSRINJ_DX12_SCALE = 0.77
 # Experimental features (all default off / safe values).
 FSRINJ_DX12_INTERP = 0          ; F4 motion-interpolation preview at startup
 FSRINJ_DX12_GENPRESENT = 0      ; F5 generated-frame presentation at startup
+FSRINJ_DX12_GENPRESENT_FORCE = 0 ; force framegen even on waitable swapchains (testing)
 FSRINJ_DX12_SCOUT_MV = 0        ; F6 scout motion-vector validation at startup
 FSRINJ_DX12_SCOUT_MV_USE = 0    ; F7 use of the copied MV candidate at startup
 FSRINJ_DX12_PACING = 1          ; pace generated frames toward the midpoint

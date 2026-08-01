@@ -1163,8 +1163,12 @@ float4 EasuPS(VSOut i) : SV_Target {
         // Presenting an extra generated frame consumes their latency slots and
         // stalls the game, so generated-present is disabled on those chains.
         g_gen_present_allowed = (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) == 0;
-        if (!g_gen_present_allowed)
-            LOGF("[overlay-dx12] swapchain uses a frame-latency waitable object; generated-frame presentation disabled for compatibility");
+        if (!g_gen_present_allowed && opt_bool(L"FSRINJ_DX12_GENPRESENT_FORCE", false)) {
+            g_gen_present_allowed = true;
+            LOGF("[overlay-dx12] WARNING: waitable swapchain detected but FSRINJ_DX12_GENPRESENT_FORCE=1; generated-frame presentation enabled anyway (expect possible stalls/judder)");
+        } else if (!g_gen_present_allowed) {
+            LOGF("[overlay-dx12] swapchain uses a frame-latency waitable object; generated-frame presentation disabled for compatibility (set FSRINJ_DX12_GENPRESENT_FORCE=1 to test anyway)");
+        }
 
         g_effect_allowed = !env_disabled(L"FSRINJ_DX12_SHARPEN");
         g_effect_enabled = g_effect_allowed;
@@ -1539,7 +1543,7 @@ float4 EasuPS(VSOut i) : SV_Target {
             ImGui::Checkbox("Frame generation  (F5)", &g_generated_present_enabled);
         } else {
             g_generated_present_enabled = false;
-            ImGui::TextDisabled("Frame generation: unavailable (waitable swapchain)");
+            ImGui::TextDisabled("Frame generation: off (waitable swapchain; force via INI)");
         }
         ImGui::Checkbox("Motion interpolation preview  (F4)", &g_interpolation_enabled);
         ImGui::TextDisabled(g_history_ready ? "History: ready" : "History: warming up");
@@ -1806,7 +1810,7 @@ bool on_present(IDXGISwapChain* sc) {
     if (pressed(VK_F4)) { g_interpolation_enabled = !g_interpolation_enabled; LOGF("[overlay-dx12] F4: motion interpolation %s (history=%s)", g_interpolation_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming"); }
     if (pressed(VK_F5)) {
         if (!g_gen_present_allowed) {
-            LOGF("[overlay-dx12] F5 ignored: waitable swapchain; generated-frame presentation unavailable in this game");
+            LOGF("[overlay-dx12] F5 ignored: waitable swapchain; set FSRINJ_DX12_GENPRESENT_FORCE=1 in fsrinj.ini to test anyway");
         } else {
             g_generated_present_enabled = !g_generated_present_enabled; g_generated_ready = false; g_generated_present_log_count = 0;
             LOGF("[overlay-dx12] F5: experimental generated-frame presentation %s (history=%s)", g_generated_present_enabled ? "enabled" : "disabled", g_history_ready ? "ready" : "warming");
