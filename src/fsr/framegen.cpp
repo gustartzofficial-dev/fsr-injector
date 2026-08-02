@@ -1,5 +1,6 @@
 #include "fsr/framegen.h"
 #include "core/config.h"
+#include "core/settings.h"
 #include "core/log.h"
 #include "hooks/depth_hook.h"
 
@@ -41,11 +42,11 @@ namespace {
 
     const int kDS=8, kSearchR=12, kSearchS=2, kPatchP=1;
 
-    struct FlowCB { unsigned W,H,lowW,lowH; float invW,invH; int searchR,searchS; int patchP,ds,useDepth,pad; };
+    struct FlowCB { unsigned W,H,lowW,lowH; float invW,invH; int searchR,searchS; int patchP,ds,useDepth; float interpT; };
 
     const char* kShader = R"(
         cbuffer FlowCB : register(b0) {
-            uint W,H,lowW,lowH; float invW,invH; int searchR,searchS; int patchP,ds,useDepth,pad;
+            uint W,H,lowW,lowH; float invW,invH; int searchR,searchS; int patchP,ds,useDepth; float interpT;
         };
         Texture2D texPrev:register(t0); Texture2D texCurr:register(t1); Texture2D flowTex:register(t2);
         Texture2D depthTex:register(t3);
@@ -98,12 +99,14 @@ namespace {
             return acc/9.0;
         }
 
-        // Interp at t=0.5; fall back to plain blend where flow is unreliable.
+        // Interp at t=interpT (0..1 between prev and curr; 0.25/0.5/0.75 in 4x
+        // mode); falls back to a plain blend where flow is unreliable.
         float4 PSMain(VSOut i):SV_Target{
             float4 f=flowTex.SampleLevel(smp,i.uv,0);
             float2 ouv=f.xy*float2(invW,invH); float conf=saturate(f.z);
-            float4 a=texPrev.SampleLevel(smp,i.uv+0.5*ouv,0);
-            float4 b=texCurr.SampleLevel(smp,i.uv-0.5*ouv,0);
+            float t=saturate(interpT);
+            float4 a=texPrev.SampleLevel(smp,i.uv+t*ouv,0);
+            float4 b=texCurr.SampleLevel(smp,i.uv-(1.0-t)*ouv,0);
             float consist=saturate(1.0-abs(luma(a.rgb)-luma(b.rgb))*4.0);
             float w=conf*consist;
             if(useDepth==1){
@@ -115,8 +118,8 @@ namespace {
             }
             float4 pc=texPrev.SampleLevel(smp,i.uv,0);
             float4 cc=texCurr.SampleLevel(smp,i.uv,0);
-            float4 plain=lerp(pc,cc,0.5);
-            float4 warped=lerp(a,b,0.5);
+            float4 plain=lerp(pc,cc,t);
+            float4 warped=lerp(a,b,t);
             float4 outc=lerp(plain,warped,w);
             // HUD/UI protection: where the two real frames are ~identical (a static
             // overlay), bypass warping entirely so HUD text / crosshairs do not smear.
@@ -182,7 +185,7 @@ namespace {
         if(!mk_cap(d,&g_curr_tex,&g_curr_srv))return false;
         if(!mk_flow(&g_flow1,&g_flow1_rtv,&g_flow1_srv))return false;
         if(!mk_flow(&g_flow2,&g_flow2_rtv,&g_flow2_srv))return false;
-        FlowCB cb{g_w,g_h,g_lw,g_lh,1.f/g_w,1.f/g_h,kSearchR,kSearchS,kPatchP,kDS,0,0};
+        FlowCB cb{g_w,g_h,g_lw,g_lh,1.f/g_w,1.f/g_h,kSearchR,kSearchS,kPatchP,kDS,0,0.5f};
         g_ctx->UpdateSubresource(g_cb,0,nullptr,&cb,0,0);
         LOGF("[fg] resources %ux%u flow=%ux%u (smooth+confidence)",g_w,g_h,g_lw,g_lh);
         return true;
@@ -219,7 +222,7 @@ namespace {
         g_ctx->PSSetShader(ps,nullptr,0); g_ctx->Draw(3,0);
     }
 
-    void draw_interpolated(ID3D11Texture2D* backbuffer){
+    void draw_interpolated(ID3D11Texture2D* backbuffer,float interp_t){
         ID3D11RenderTargetView* bbrtv=nullptr;
         if(FAILED(g_dev->CreateRenderTargetView(backbuffer,nullptr,&bbrtv))||!bbrtv) return;
         SB s; save(s);
@@ -232,7 +235,7 @@ namespace {
 
         // Optional depth-assisted disocclusion (default off; only if a readable depth exists).
         ID3D11ShaderResourceView* dsrv = core::config().use_depth.load() ? depth::current_srv() : nullptr;
-        FlowCB cb{g_w,g_h,g_lw,g_lh,1.f/g_w,1.f/g_h,kSearchR,kSearchS,kPatchP,kDS, dsrv?1:0, 0};
+        FlowCB cb{g_w,g_h,g_lw,g_lh,1.f/g_w,1.f/g_h,kSearchR,kSearchS,kPatchP,kDS, dsrv?1:0, interp_t};
         g_ctx->UpdateSubresource(g_cb,0,nullptr,&cb,0,0);
         g_ctx->PSSetShaderResources(3,1,&dsrv);
 
@@ -240,6 +243,38 @@ namespace {
         ID3D11ShaderResourceView* nul4[4]={nullptr,nullptr,nullptr,nullptr}; g_ctx->PSSetShaderResources(0,4,nul4);
         restore(s); bbrtv->Release();
     }
+}
+
+// Mirrors the DX12 guard: swapchains created with a frame-latency waitable
+// object budget exactly one Present per wait, so our extra presents consume
+// their latency slots and stall the game. Checked once, lazily.
+bool gen_present_allowed(IDXGISwapChain* sc){
+    static int cached=-1;
+    if(cached>=0) return cached!=0;
+    DXGI_SWAP_CHAIN_DESC d{};
+    bool allowed=true;
+    if(SUCCEEDED(sc->GetDesc(&d)) && (d.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)){
+        // Accept the API-neutral key first, then the DX12-prefixed one, so a
+        // single INI works for both backends.
+        const bool forced = core::settings::has(L"FSRINJ_GENPRESENT_FORCE")
+                          ? core::settings::get_bool(L"FSRINJ_GENPRESENT_FORCE",false)
+                          : core::settings::get_bool(L"FSRINJ_DX12_GENPRESENT_FORCE",false);
+        if(forced){
+            LOGF("[fg] WARNING: waitable swapchain but GENPRESENT_FORCE=1; presenting generated frames anyway");
+        } else {
+            allowed=false;
+            LOGF("[fg] waitable swapchain detected; DX11 generated-frame presentation disabled (set FSRINJ_GENPRESENT_FORCE=1 to test anyway)");
+        }
+    }
+    cached=allowed?1:0;
+    return allowed;
+}
+
+unsigned multiplier(){
+    unsigned m=(unsigned)(core::settings::has(L"FSRINJ_GENMULT")
+                          ? core::settings::get_int(L"FSRINJ_GENMULT",2,2,4)
+                          : core::settings::get_int(L"FSRINJ_DX12_GENMULT",2,2,4));
+    return m<2?2:(m>4?4:m);
 }
 
 void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flags){
@@ -251,10 +286,17 @@ void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flag
     if(!ensure(bb)){ bb->Release(); return; }
     g_ctx->CopyResource(g_curr_tex,bb);
     if(g_have_prev){
-        draw_interpolated(bb);
-        if (core::config().dx11_frame_pacing.load()) {
-            present(sc,0,flags);
-            g_gen.fetch_add(1,std::memory_order_relaxed);
+        const bool can_present = core::config().dx11_frame_pacing.load() && gen_present_allowed(sc);
+        // 2x..4x: render N-1 interpolated frames at t = k/N and present each.
+        // Without presentation only the midpoint frame is drawn (preview mode).
+        const unsigned mult = can_present ? multiplier() : 2;
+        for(unsigned k=1;k<mult;++k){
+            const float t=(float)k/(float)mult;
+            draw_interpolated(bb,t);
+            if(can_present){
+                present(sc,0,flags);
+                g_gen.fetch_add(1,std::memory_order_relaxed);
+            }
         }
         g_ctx->CopyResource(bb,g_curr_tex);
     }

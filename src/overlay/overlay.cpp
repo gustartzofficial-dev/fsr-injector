@@ -146,10 +146,14 @@ void on_present(IDXGISwapChain* sc) {
         g_init = true;
     }
 
-    // Toggle on key edge.
+    // Toggle on key edge. Edge state always updates (so refocusing never
+    // replays a stale press), but the toggle only fires while the game window
+    // is foreground -- matching the DX12 path, so typing in another app can't
+    // flip injector settings.
     static bool prev = false;
     bool down = (GetAsyncKeyState(core::config().toggle_key.load()) & 0x8000) != 0;
-    if (down && !prev) {
+    const bool focused = !g_hwnd || GetForegroundWindow() == g_hwnd;
+    if (down && !prev && focused) {
         bool v = core::config().overlay_visible.load();
         core::config().overlay_visible.store(!v);
     }

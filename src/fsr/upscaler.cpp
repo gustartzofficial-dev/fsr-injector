@@ -1,6 +1,8 @@
 #include "fsr/upscaler.h"
 #include "core/config.h"
 #include "core/log.h"
+#include "fsr/fsr1_constants.h"
+#include "fsr/ffx_include.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -20,11 +22,27 @@ namespace {
     ID3D11Texture2D*     g_tmp=nullptr; ID3D11ShaderResourceView* g_tmp_srv=nullptr;
     bool g_ready=false; UINT g_w=0,g_h=0; DXGI_FORMAT g_fmt=DXGI_FORMAT_UNKNOWN;
 
-    struct CB { float invW,invH,strength,pad; };
+    // Matches the HLSL cbuffer below. rcasCon holds AMD's packed RCAS constants;
+    // fsrActive selects the real FidelityFX path at draw time.
+    struct CB { float invW,invH,strength,fsrActive; unsigned rcasCon[4]; };
+    bool g_fsr_real=false;
+    fsr1::RcasConstants g_rcas_con{};
+    float g_rcas_for_strength=-1.f;
 
     const char* kShader = R"(
-        cbuffer CB:register(b0){ float invW,invH,strength,pad; };
+        cbuffer CB:register(b0){ float invW,invH,strength,fsrActive; uint4 rcasCon; };
         Texture2D tex:register(t0); SamplerState smp:register(s0);
+#ifdef FSRINJ_REAL_FSR
+        // Genuine AMD FidelityFX RCAS (MIT). The DX11 path sharpens the finished
+        // backbuffer at native resolution, which is exactly RCAS's design point.
+        #define A_GPU 1
+        #define A_HLSL 1
+        #include "ffx_a.h"
+        #define FSR_RCAS_F 1
+        AF4 FsrRcasLoadF(ASU2 p){ return tex.Load(int3(p,0)); }
+        void FsrRcasInputF(inout AF1 r,inout AF1 g,inout AF1 b){}
+        #include "ffx_fsr1.h"
+#endif
         struct VSOut{ float4 pos:SV_POSITION; float2 uv:TEXCOORD0; };
         VSOut VSMain(uint id:SV_VertexID){ VSOut o; o.uv=float2((id<<1)&2,id&2);
             o.pos=float4(o.uv*float2(2,-2)+float2(-1,1),0,1); return o; }
@@ -32,6 +50,12 @@ namespace {
 
         // Contrast-adaptive sharpen with noise floor + deringing clamp.
         float4 PSMain(VSOut i):SV_Target{
+#ifdef FSRINJ_REAL_FSR
+            if(fsrActive>0.5){
+                float3 rc; FsrRcasF(rc.r,rc.g,rc.b,AU2(i.pos.xy),rcasCon);
+                return float4(saturate(rc),1);
+            }
+#endif
             float2 t=float2(invW,invH);
             float3 c=tex.SampleLevel(smp,i.uv,0).rgb;
             float3 n=tex.SampleLevel(smp,i.uv+float2(0,-1)*t,0).rgb;
@@ -51,10 +75,14 @@ namespace {
         }
     )";
 
-    bool compile_one(const char* e,const char* t,ID3DBlob** o){
+    bool compile_one(const char* e,const char* t,ID3DBlob** o,bool real_fsr,bool quiet=false){
         ID3DBlob* err=nullptr;
-        if(FAILED(D3DCompile(kShader,strlen(kShader),nullptr,nullptr,nullptr,e,t,0,0,o,&err))){
-            LOGF("[up] compile %s failed: %s",e,err?(char*)err->GetBufferPointer():"?"); if(err)err->Release(); return false; }
+        const D3D_SHADER_MACRO defs[]={{"FSRINJ_REAL_FSR","1"},{nullptr,nullptr}};
+        HRESULT hr=D3DCompile(kShader,strlen(kShader),"fsrinj_dx11",real_fsr?defs:nullptr,
+                              &fsr1::include_handler(),e,t,0,0,o,&err);
+        if(FAILED(hr)){
+            LOGF("[up] compile %s failed%s: %s",e,quiet?" (falling back)":"",err?(char*)err->GetBufferPointer():"?");
+            if(err)err->Release(); return false; }
         if(err)err->Release(); return true;
     }
     bool init(IDXGISwapChain* sc){
@@ -62,15 +90,24 @@ namespace {
         if(FAILED(sc->GetDevice(__uuidof(ID3D11Device),(void**)&g_dev))) return false;
         g_dev->GetImmediateContext(&g_ctx);
         ID3DBlob *v=nullptr,*p=nullptr;
-        if(!compile_one("VSMain","vs_5_0",&v)) return false;
-        if(!compile_one("PSMain","ps_5_0",&p)){v->Release();return false;}
+        // Try the real FidelityFX RCAS build first; fall back to the legacy
+        // contrast-adaptive sharpener if it cannot compile (same policy as DX12).
+        g_fsr_real = compile_one("VSMain","vs_5_0",&v,true,true) &&
+                     compile_one("PSMain","ps_5_0",&p,true,true);
+        if(!g_fsr_real){
+            if(v){v->Release();v=nullptr;} if(p){p->Release();p=nullptr;}
+            if(!compile_one("VSMain","vs_5_0",&v,false)) return false;
+            if(!compile_one("PSMain","ps_5_0",&p,false)){v->Release();return false;}
+        }
         g_dev->CreateVertexShader(v->GetBufferPointer(),v->GetBufferSize(),nullptr,&g_vs);
         g_dev->CreatePixelShader(p->GetBufferPointer(),p->GetBufferSize(),nullptr,&g_ps);
         v->Release();p->Release();
         D3D11_SAMPLER_DESC sd{}; sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP; g_dev->CreateSamplerState(&sd,&g_smp);
         D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth=sizeof(CB); cbd.Usage=D3D11_USAGE_DEFAULT; cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER; g_dev->CreateBuffer(&cbd,nullptr,&g_cb);
-        g_ready=g_vs&&g_ps&&g_smp&&g_cb; if(g_ready) LOGF("[up] adaptive sharpener initialized");
+        g_ready=g_vs&&g_ps&&g_smp&&g_cb;
+        if(g_ready) LOGF("[up] DX11 sharpener initialized (%s)",
+                         g_fsr_real?"AMD FidelityFX RCAS":"legacy contrast-adaptive");
         return g_ready;
     }
     bool ensure_tmp(ID3D11Texture2D* bb){
@@ -109,7 +146,14 @@ void sharpen(IDXGISwapChain* sc){
     ID3D11RenderTargetView* rtv=nullptr;
     if(FAILED(g_dev->CreateRenderTargetView(bb,nullptr,&rtv))||!rtv){ bb->Release(); return; }
 
-    CB cb{ 1.f/g_w, 1.f/g_h, cfg.sharpness.load(), 0 };
+    const float strength=cfg.sharpness.load();
+    if(g_fsr_real && g_rcas_for_strength!=strength){
+        fsr1::rcas_constants(g_rcas_con, fsr1::slider_to_stops(strength));
+        g_rcas_for_strength=strength;
+    }
+    CB cb{ 1.f/g_w, 1.f/g_h, strength, g_fsr_real?1.f:0.f };
+    cb.rcasCon[0]=g_rcas_con.con[0]; cb.rcasCon[1]=g_rcas_con.con[1];
+    cb.rcasCon[2]=g_rcas_con.con[2]; cb.rcasCon[3]=g_rcas_con.con[3];
     g_ctx->UpdateSubresource(g_cb,0,nullptr,&cb,0,0);
 
     SB s; save(s);

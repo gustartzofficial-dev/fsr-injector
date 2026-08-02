@@ -7,10 +7,9 @@
 #include "fsr/fsr1_constants.h"
 
 // Embedded copies of AMD's FidelityFX FSR1 headers (MIT), generated at build
-// time from third_party/ffx by cmake/embed_text_file.cmake. Served to
-// D3DCompile through the ID3DInclude handler below.
-#include "ffx_a_embedded.h"
-#include "ffx_fsr1_embedded.h"
+// time from third_party/ffx by cmake/embed_text_file.cmake, served to
+// D3DCompile through the shared include handler (also used by the DX11 path).
+#include "fsr/ffx_include.h"
 
 #include <windows.h>
 #include <d3d12.h>
@@ -288,25 +287,6 @@ namespace {
         return true;
     }
 
-    // Serves the embedded FidelityFX headers to the runtime HLSL compiler, so the
-    // shaders can '#include "ffx_a.h"' with no files on disk next to the game.
-    class FfxInclude : public ID3DInclude {
-    public:
-        HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE, LPCSTR file, LPCVOID,
-                                       LPCVOID* out_data, UINT* out_size) override {
-            if (!file || !out_data || !out_size) return E_FAIL;
-            if (std::strcmp(file, "ffx_a.h") == 0) {
-                *out_data = g_ffx_a_h; *out_size = g_ffx_a_h_len; return S_OK;
-            }
-            if (std::strcmp(file, "ffx_fsr1.h") == 0) {
-                *out_data = g_ffx_fsr1_h; *out_size = g_ffx_fsr1_h_len; return S_OK;
-            }
-            return E_FAIL;
-        }
-        HRESULT STDMETHODCALLTYPE Close(LPCVOID) override { return S_OK; }
-    };
-    FfxInclude g_ffx_include;
-
     bool compile_shader(const char* source, const char* entry, const char* target, ID3DBlob** blob,
                         const D3D_SHADER_MACRO* defines = nullptr, bool quiet = false) {
         UINT flags = 0;
@@ -314,7 +294,7 @@ namespace {
         flags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
     #endif
         ID3DBlob* errors = nullptr;
-        HRESULT hr = D3DCompile(source, std::strlen(source), "fsrinj", defines, &g_ffx_include,
+        HRESULT hr = D3DCompile(source, std::strlen(source), "fsrinj", defines, &fsr1::include_handler(),
                                 entry, target, flags, 0, blob, &errors);
         if (FAILED(hr)) {
             if (errors) {
@@ -1169,7 +1149,10 @@ float4 EasuPS(VSOut i) : SV_Target {
         // Presenting an extra generated frame consumes their latency slots and
         // stalls the game, so generated-present is disabled on those chains.
         g_gen_present_allowed = (desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) == 0;
-        if (!g_gen_present_allowed && opt_bool(L"FSRINJ_DX12_GENPRESENT_FORCE", false)) {
+        const bool force_gen = core::settings::has(L"FSRINJ_GENPRESENT_FORCE")
+                             ? opt_bool(L"FSRINJ_GENPRESENT_FORCE", false)
+                             : opt_bool(L"FSRINJ_DX12_GENPRESENT_FORCE", false);
+        if (!g_gen_present_allowed && force_gen) {
             g_gen_present_allowed = true;
             LOGF("[overlay-dx12] WARNING: waitable swapchain detected but FSRINJ_DX12_GENPRESENT_FORCE=1; generated-frame presentation enabled anyway (expect possible stalls/judder)");
         } else if (!g_gen_present_allowed) {
@@ -1185,7 +1168,9 @@ float4 EasuPS(VSOut i) : SV_Target {
         g_scale = env_scale(L"FSRINJ_DX12_SCALE", 0.77f);
         g_interpolation_enabled = opt_bool(L"FSRINJ_DX12_INTERP", false);
         g_generated_present_enabled = g_gen_present_allowed && opt_bool(L"FSRINJ_DX12_GENPRESENT", false);
-        g_gen_mult = (unsigned)core::settings::get_int(L"FSRINJ_DX12_GENMULT", 2, 2, 4);
+        g_gen_mult = (unsigned)(core::settings::has(L"FSRINJ_GENMULT")
+                                ? core::settings::get_int(L"FSRINJ_GENMULT", 2, 2, 4)
+                                : core::settings::get_int(L"FSRINJ_DX12_GENMULT", 2, 2, 4));
         g_scout_motion_enabled = opt_bool(L"FSRINJ_DX12_SCOUT_MV", false);
         g_scout_motion_use_enabled = opt_bool(L"FSRINJ_DX12_SCOUT_MV_USE", false);
         g_pacing_enabled = !env_disabled(L"FSRINJ_DX12_PACING");

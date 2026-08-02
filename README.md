@@ -21,7 +21,7 @@ This project is licensed under the [MIT License](LICENSE).
 - DX12 swapchain detection and Present/Present1 hooks.
 - DX12 command queue capture.
 - Native non-ImGui DX12 overlay.
-- Genuine AMD FidelityFX FSR 1.0 (EASU + RCAS) upscale path on DX12, with automatic fallback to the previous approximation shaders if the FSR shaders fail to compile at runtime (the log states which path is active).
+- Genuine AMD FidelityFX FSR 1.0 on both backends: EASU + RCAS with render scaling on DX12, and RCAS sharpening on DX11, with automatic fallback to the previous approximation shaders if the FSR shaders fail to compile at runtime (the log states which path is active).
 - Runtime scale and sharpness controls.
 - Frame history capture.
 - Experimental motion/interpolation preview.
