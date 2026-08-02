@@ -85,16 +85,30 @@ namespace {
 
         std::lock_guard<std::mutex> lk(g_mtx);
         ++g_seen_count;
-        if (area < g_best_area) return; // keep largest screen-ish buffer, accept equal to refresh handle
-        if (area == g_best_area && g_cand == tex) return;
+        if (area < g_best_area) return; // keep largest screen-ish buffer
+        // Equal-area case: games commonly alternate between two same-size depth
+        // buffers (e.g. D24S8 and D16). Only refresh the handle for the SAME
+        // logical buffer (matching format); otherwise the candidate ping-pongs
+        // every frame, churning AddRef/Release and flooding the log.
+        if (area == g_best_area) {
+            if (g_cand == tex) return;
+            if (g_cand && d.Format != g_fmt) return;
+        }
 
         release_private_locked();
         if (g_cand) { g_cand->Release(); g_cand = nullptr; }
         tex->AddRef();
         g_cand = tex; g_w = d.Width; g_h = d.Height; g_fmt = d.Format;
         g_best_area = area;
-        LOGF("[depth] candidate %ux%u %s bind=0x%X srv=%s", g_w, g_h, fmt_name_locked(d.Format), d.BindFlags,
-             (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "yes" : "no");
+        // Log only when the candidate's identity actually changes, not on every
+        // handle refresh -- this used to emit thousands of lines per second.
+        static UINT last_w = 0, last_h = 0;
+        static DXGI_FORMAT last_fmt = DXGI_FORMAT_UNKNOWN;
+        if (g_w != last_w || g_h != last_h || d.Format != last_fmt) {
+            last_w = g_w; last_h = g_h; last_fmt = d.Format;
+            LOGF("[depth] candidate %ux%u %s bind=0x%X srv=%s", g_w, g_h, fmt_name_locked(d.Format), d.BindFlags,
+                 (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "yes" : "no");
+        }
     }
 
     bool ensure_copy_locked(ID3D11Device* dev) {

@@ -10,6 +10,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/settings.h"
+#include "core/version.h"
 
 namespace core {
     Config& config() {
@@ -47,7 +48,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID reserved) {
         const std::wstring dir = dll_directory(self);
         core::log_init(dir);
         core::settings::init(dir);
-        core::log_line("[boot] fsr-injector starting");
+        core::log_line("[boot] fsr-injector starting, build " FSRINJ_VERSION);
         // Resolve the real DXGI now so forwarded exports never race the worker.
         proxy::load_real_dxgi();
         std::thread(install_hooks_thread).detach();

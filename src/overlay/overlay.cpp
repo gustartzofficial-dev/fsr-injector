@@ -1,6 +1,8 @@
 #include "overlay/overlay.h"
 #include "overlay/overlay_dx12.h"
 #include "core/config.h"
+#include "core/settings.h"
+#include "core/version.h"
 #include "core/log.h"
 #include "detect/upscaler_detect.h"
 #include "fsr/fsr_integration.h"
@@ -71,7 +73,16 @@ namespace {
         g_orig_wndproc = (WNDPROC)SetWindowLongPtrW(
             g_hwnd, GWLP_WNDPROC, (LONG_PTR)wndproc);
 
-        LOGF("[overlay] initialized on hwnd %p", (void*)g_hwnd);
+        // Startup state from INI/env. Both default OFF, which is why a fresh
+        // install shows no effect until enabled -- these keys let a tester turn
+        // the DX11 path on without touching the menu.
+        auto& cfg = core::config();
+        cfg.upscaling_enabled.store(core::settings::get_bool(L"FSRINJ_DX11_SHARPEN", false));
+        cfg.framegen_enabled.store(core::settings::get_bool(L"FSRINJ_DX11_FRAMEGEN", false));
+        LOGF("[overlay] initialized on hwnd %p build %s (dx11 sharpen=%s framegen=%s)",
+             (void*)g_hwnd, FSRINJ_VERSION,
+             cfg.upscaling_enabled.load() ? "on" : "off",
+             cfg.framegen_enabled.load() ? "on" : "off");
         return true;
     }
 
@@ -81,6 +92,7 @@ namespace {
 
         if (!g_profile_done) { g_profile = detect::scan_loaded_modules(); g_profile_done = true; }
         ImGui::Text("Game profile: %s", detect::profile_name(g_profile.profile));
+        ImGui::TextDisabled("build " FSRINJ_VERSION " | DirectX 11 path");
         ImGui::Separator();
 
         bool up = cfg.upscaling_enabled.load();
@@ -98,6 +110,10 @@ namespace {
         ImGui::Text("DX11 Frame Generation");
         bool fg = cfg.framegen_enabled.load();
         if (ImGui::Checkbox("Enable frame generation", &fg)) cfg.framegen_enabled.store(fg);
+        int mult_idx = (int)framegen::multiplier() - 2;
+        const char* mults[] = { "2x", "3x", "4x" };
+        if (ImGui::Combo("FG multiplier", &mult_idx, mults, 3))
+            framegen::set_multiplier((unsigned)(mult_idx + 2));
         bool pacing = cfg.dx11_frame_pacing.load();
         if (ImGui::Checkbox("Generated-frame pacing", &pacing)) cfg.dx11_frame_pacing.store(pacing);
         bool overlayCapture = cfg.dx11_overlay_in_generated.load();

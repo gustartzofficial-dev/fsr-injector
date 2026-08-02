@@ -19,6 +19,10 @@ void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flag
 void on_resize();
 void shutdown();
 
+// Frame-generation multiplier (2x/3x/4x), shared by the menu and the INI.
+unsigned multiplier();
+void set_multiplier(unsigned m);
+
 uint64_t real_frames();
 uint64_t generated_frames();
 

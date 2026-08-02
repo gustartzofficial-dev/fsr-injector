@@ -270,11 +270,26 @@ bool gen_present_allowed(IDXGISwapChain* sc){
     return allowed;
 }
 
+// Frame-generation multiplier. Seeded once from the INI/env, then live-editable
+// from the menu via set_multiplier().
+std::atomic<unsigned> g_mult{0};
+
 unsigned multiplier(){
-    unsigned m=(unsigned)(core::settings::has(L"FSRINJ_GENMULT")
-                          ? core::settings::get_int(L"FSRINJ_GENMULT",2,2,4)
-                          : core::settings::get_int(L"FSRINJ_DX12_GENMULT",2,2,4));
-    return m<2?2:(m>4?4:m);
+    unsigned m=g_mult.load(std::memory_order_relaxed);
+    if(m==0){
+        m=(unsigned)(core::settings::has(L"FSRINJ_GENMULT")
+                     ? core::settings::get_int(L"FSRINJ_GENMULT",2,2,4)
+                     : core::settings::get_int(L"FSRINJ_DX12_GENMULT",2,2,4));
+        if(m<2)m=2; if(m>4)m=4;
+        g_mult.store(m,std::memory_order_relaxed);
+    }
+    return m;
+}
+
+void set_multiplier(unsigned m){
+    if(m<2)m=2; if(m>4)m=4;
+    if(g_mult.exchange(m,std::memory_order_relaxed)!=m)
+        LOGF("[fg] DX11 frame-generation multiplier set to %ux",m);
 }
 
 void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flags){

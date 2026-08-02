@@ -3,6 +3,7 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/settings.h"
+#include "core/version.h"
 #include "capture/generic_resource_scout.h"
 #include "fsr/fsr1_constants.h"
 
@@ -1534,16 +1535,28 @@ float4 EasuPS(VSOut i) : SV_Target {
         ImGui::Separator();
         if (g_gen_present_allowed) {
             ImGui::Checkbox("Frame generation  (F5)", &g_generated_present_enabled);
-            int mult_idx = (int)g_gen_mult - 2;
-            const char* mults[] = { "2x", "3x", "4x" };
-            if (ImGui::Combo("FG multiplier", &mult_idx, mults, 3)) {
-                g_gen_mult = (unsigned)(mult_idx + 2);
-                LOGF("[overlay-dx12] frame-generation multiplier set to %ux", g_gen_mult);
-            }
         } else {
             g_generated_present_enabled = false;
-            ImGui::TextDisabled("Frame generation: off (waitable swapchain; force via INI)");
+            ImGui::TextDisabled("Frame generation: off (waitable swapchain)");
+            ImGui::TextDisabled("  set FSRINJ_GENPRESENT_FORCE=1 in fsrinj.ini");
         }
+        // The multiplier is shown unconditionally: previously it lived inside the
+        // branch above, so on waitable swapchains the control vanished entirely
+        // and a correct build looked identical to an old one.
+        {
+            int mult_idx = (int)g_gen_mult - 2;
+            const char* mults[] = { "2x", "3x", "4x" };
+            if (ImGui::Combo("FG multiplier  (F8)", &mult_idx, mults, 3)) {
+                g_gen_mult = (unsigned)(mult_idx + 2);
+                g_gen_ready = 0;
+                LOGF("[overlay-dx12] frame-generation multiplier set to %ux", g_gen_mult);
+            }
+            if (!g_generated_present_enabled)
+                ImGui::TextDisabled("  (takes effect when frame generation is on)");
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("build " FSRINJ_VERSION " | upscaler: %s",
+                            g_fsr_real ? "FidelityFX FSR 1.0" : "legacy");
         ImGui::Checkbox("Motion interpolation preview  (F4)", &g_interpolation_enabled);
         ImGui::TextDisabled(g_history_ready ? "History: ready" : "History: warming up");
         ImGui::Separator();
