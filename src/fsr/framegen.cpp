@@ -28,6 +28,8 @@ namespace {
     ID3D11PixelShader*   g_ps_interp = nullptr;   // motion-compensated interpolation
     ID3D11SamplerState*  g_smp       = nullptr;
     ID3D11BlendState*    g_blend     = nullptr;
+    ID3D11DepthStencilState* g_dss   = nullptr;  // depth off for our fullscreen passes
+    ID3D11RasterizerState*   g_rs     = nullptr;  // solid, no cull, scissor off
     ID3D11Buffer*        g_cb        = nullptr;
 
     ID3D11Texture2D* g_prev_tex=nullptr; ID3D11ShaderResourceView* g_prev_srv=nullptr;
@@ -151,8 +153,14 @@ namespace {
         D3D11_SAMPLER_DESC sd{}; sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP; g_dev->CreateSamplerState(&sd,&g_smp);
         D3D11_BLEND_DESC bd{}; bd.RenderTarget[0].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL; g_dev->CreateBlendState(&bd,&g_blend);
+        // Depth/raster state must be forced too: a leftover scissor rect or depth
+        // test from the game can clip or reject our fullscreen triangle.
+        D3D11_DEPTH_STENCIL_DESC dd{}; dd.DepthEnable=FALSE; dd.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc=D3D11_COMPARISON_ALWAYS; dd.StencilEnable=FALSE; g_dev->CreateDepthStencilState(&dd,&g_dss);
+        D3D11_RASTERIZER_DESC rd{}; rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=D3D11_CULL_NONE;
+        rd.DepthClipEnable=TRUE; rd.ScissorEnable=FALSE; g_dev->CreateRasterizerState(&rd,&g_rs);
         D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth=sizeof(FlowCB); cbd.Usage=D3D11_USAGE_DEFAULT; cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER; g_dev->CreateBuffer(&cbd,nullptr,&g_cb);
-        return g_vs&&g_ps_flow&&g_ps_smooth&&g_ps_interp&&g_smp&&g_blend&&g_cb;
+        return g_vs&&g_ps_flow&&g_ps_smooth&&g_ps_interp&&g_smp&&g_blend&&g_cb&&g_dss&&g_rs;
     }
 
     void rel(){
@@ -201,17 +209,22 @@ namespace {
     struct SB { ID3D11RenderTargetView* rtv=nullptr; ID3D11DepthStencilView* dsv=nullptr;
         D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]; UINT vpN=D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
         ID3D11VertexShader* vs=nullptr; ID3D11PixelShader* ps=nullptr; ID3D11InputLayout* il=nullptr; D3D11_PRIMITIVE_TOPOLOGY topo;
-        ID3D11ShaderResourceView* srv[4]={}; ID3D11SamplerState* smp=nullptr; ID3D11BlendState* bl=nullptr; FLOAT bf[4]; UINT mk=0; ID3D11Buffer* cb=nullptr; };
+        ID3D11ShaderResourceView* srv[4]={}; ID3D11SamplerState* smp=nullptr; ID3D11BlendState* bl=nullptr; FLOAT bf[4]; UINT mk=0; ID3D11Buffer* cb=nullptr;
+        ID3D11DepthStencilState* dss=nullptr; UINT sref=0; ID3D11RasterizerState* rs=nullptr;
+        D3D11_RECT sc[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]{}; UINT scN=D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE; };
     void save(SB& s){ g_ctx->OMGetRenderTargets(1,&s.rtv,&s.dsv); g_ctx->RSGetViewports(&s.vpN,s.vp);
         g_ctx->VSGetShader(&s.vs,nullptr,nullptr); g_ctx->PSGetShader(&s.ps,nullptr,nullptr); g_ctx->IAGetInputLayout(&s.il);
         g_ctx->IAGetPrimitiveTopology(&s.topo); g_ctx->PSGetShaderResources(0,4,s.srv); g_ctx->PSGetSamplers(0,1,&s.smp);
-        g_ctx->OMGetBlendState(&s.bl,s.bf,&s.mk); g_ctx->PSGetConstantBuffers(0,1,&s.cb); }
+        g_ctx->OMGetBlendState(&s.bl,s.bf,&s.mk); g_ctx->PSGetConstantBuffers(0,1,&s.cb);
+        g_ctx->OMGetDepthStencilState(&s.dss,&s.sref); g_ctx->RSGetState(&s.rs); g_ctx->RSGetScissorRects(&s.scN,s.sc); }
     void restore(SB& s){ g_ctx->OMSetRenderTargets(1,&s.rtv,s.dsv); if(s.vpN)g_ctx->RSSetViewports(s.vpN,s.vp);
         g_ctx->VSSetShader(s.vs,nullptr,0); g_ctx->PSSetShader(s.ps,nullptr,0); g_ctx->IASetInputLayout(s.il);
         g_ctx->IASetPrimitiveTopology(s.topo); g_ctx->PSSetShaderResources(0,4,s.srv); g_ctx->PSSetSamplers(0,1,&s.smp);
         g_ctx->OMSetBlendState(s.bl,s.bf,s.mk); g_ctx->PSSetConstantBuffers(0,1,&s.cb);
+        g_ctx->OMSetDepthStencilState(s.dss,s.sref); g_ctx->RSSetState(s.rs); if(s.scN)g_ctx->RSSetScissorRects(s.scN,s.sc);
         if(s.rtv)s.rtv->Release(); if(s.dsv)s.dsv->Release(); if(s.vs)s.vs->Release(); if(s.ps)s.ps->Release();
-        if(s.il)s.il->Release(); for(int i=0;i<4;i++) if(s.srv[i])s.srv[i]->Release(); if(s.smp)s.smp->Release(); if(s.bl)s.bl->Release(); if(s.cb)s.cb->Release(); }
+        if(s.il)s.il->Release(); for(int i=0;i<4;i++) if(s.srv[i])s.srv[i]->Release(); if(s.smp)s.smp->Release(); if(s.bl)s.bl->Release(); if(s.cb)s.cb->Release();
+        if(s.dss)s.dss->Release(); if(s.rs)s.rs->Release(); }
 
     void pass(ID3D11RenderTargetView* rt,float vw,float vh,ID3D11PixelShader* ps,
               ID3D11ShaderResourceView* a,ID3D11ShaderResourceView* b,ID3D11ShaderResourceView* c){
@@ -227,6 +240,7 @@ namespace {
         if(FAILED(g_dev->CreateRenderTargetView(backbuffer,nullptr,&bbrtv))||!bbrtv) return;
         SB s; save(s);
         const FLOAT bf[4]={0,0,0,0}; g_ctx->OMSetBlendState(g_blend,bf,0xffffffff);
+        g_ctx->OMSetDepthStencilState(g_dss,0); g_ctx->RSSetState(g_rs);
         g_ctx->IASetInputLayout(nullptr); g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_ctx->VSSetShader(g_vs,nullptr,0); g_ctx->PSSetSamplers(0,1,&g_smp); g_ctx->PSSetConstantBuffers(0,1,&g_cb);
         ID3D11ShaderResourceView* nul=nullptr;
@@ -320,6 +334,8 @@ void before_present(IDXGISwapChain* sc, PresentTrampoline present, unsigned flag
 }
 void on_resize(){ rel(); }
 void shutdown(){ rel();
+    if(g_rs)g_rs->Release(); if(g_dss)g_dss->Release();
+    g_rs=nullptr; g_dss=nullptr;
     if(g_cb)g_cb->Release(); if(g_blend)g_blend->Release(); if(g_smp)g_smp->Release();
     if(g_ps_interp)g_ps_interp->Release(); if(g_ps_smooth)g_ps_smooth->Release(); if(g_ps_flow)g_ps_flow->Release(); if(g_vs)g_vs->Release();
     if(g_ctx)g_ctx->Release(); if(g_dev)g_dev->Release(); g_ready=false; }

@@ -20,6 +20,13 @@ namespace {
     ID3D11SamplerState*  g_smp=nullptr;
     ID3D11Buffer*        g_cb=nullptr;
     ID3D11Texture2D*     g_tmp=nullptr; ID3D11ShaderResourceView* g_tmp_srv=nullptr;
+    // Explicit pipeline state for our fullscreen pass. Without these we inherit
+    // whatever the game left bound at Present time -- an additive/alpha blend
+    // state made the sharpened quad blend ONTO the frame instead of replacing
+    // it, which showed up as the image randomly getting brighter.
+    ID3D11BlendState*        g_blend=nullptr;   // opaque, write RGBA
+    ID3D11DepthStencilState* g_dss=nullptr;     // depth test/write off
+    ID3D11RasterizerState*   g_rs=nullptr;      // solid, no cull, no scissor
     bool g_ready=false; UINT g_w=0,g_h=0; DXGI_FORMAT g_fmt=DXGI_FORMAT_UNKNOWN;
 
     // Matches the HLSL cbuffer below. rcasCon holds AMD's packed RCAS constants;
@@ -105,7 +112,20 @@ namespace {
         D3D11_SAMPLER_DESC sd{}; sd.Filter=D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP; g_dev->CreateSamplerState(&sd,&g_smp);
         D3D11_BUFFER_DESC cbd{}; cbd.ByteWidth=sizeof(CB); cbd.Usage=D3D11_USAGE_DEFAULT; cbd.BindFlags=D3D11_BIND_CONSTANT_BUFFER; g_dev->CreateBuffer(&cbd,nullptr,&g_cb);
-        g_ready=g_vs&&g_ps&&g_smp&&g_cb;
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].BlendEnable=FALSE;
+        bd.RenderTarget[0].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
+        g_dev->CreateBlendState(&bd,&g_blend);
+        D3D11_DEPTH_STENCIL_DESC dd{};
+        dd.DepthEnable=FALSE; dd.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;
+        dd.DepthFunc=D3D11_COMPARISON_ALWAYS; dd.StencilEnable=FALSE;
+        g_dev->CreateDepthStencilState(&dd,&g_dss);
+        D3D11_RASTERIZER_DESC rd{};
+        rd.FillMode=D3D11_FILL_SOLID; rd.CullMode=D3D11_CULL_NONE;
+        rd.DepthClipEnable=TRUE; rd.ScissorEnable=FALSE;
+        g_dev->CreateRasterizerState(&rd,&g_rs);
+
+        g_ready=g_vs&&g_ps&&g_smp&&g_cb&&g_blend&&g_dss&&g_rs;
         if(g_ready) LOGF("[up] DX11 sharpener initialized (%s)",
                          g_fsr_real?"AMD FidelityFX RCAS":"legacy contrast-adaptive");
         return g_ready;
@@ -120,18 +140,34 @@ namespace {
         if(FAILED(g_dev->CreateTexture2D(&td,nullptr,&g_tmp))) return false;
         return SUCCEEDED(g_dev->CreateShaderResourceView(g_tmp,nullptr,&g_tmp_srv));
     }
+    // Full state block. UE4-era engines cache render state in their RHI and skip
+    // redundant sets, so anything we change without restoring can corrupt later
+    // frames. Blend/depth/raster/scissor are the ones that visibly matter.
     struct SB { ID3D11RenderTargetView* rtv=nullptr; ID3D11DepthStencilView* dsv=nullptr;
         D3D11_VIEWPORT vp[16]; UINT vpN=16; ID3D11VertexShader* vs=nullptr; ID3D11PixelShader* ps=nullptr;
         ID3D11InputLayout* il=nullptr; D3D11_PRIMITIVE_TOPOLOGY topo; ID3D11ShaderResourceView* srv=nullptr;
-        ID3D11SamplerState* smp=nullptr; ID3D11Buffer* cb=nullptr; };
+        ID3D11SamplerState* smp=nullptr; ID3D11Buffer* cb=nullptr;
+        ID3D11BlendState* bl=nullptr; FLOAT bf[4]{}; UINT mask=0xffffffff;
+        ID3D11DepthStencilState* dss=nullptr; UINT sref=0;
+        ID3D11RasterizerState* rs=nullptr;
+        D3D11_RECT sc[16]{}; UINT scN=16; };
     void save(SB& s){ g_ctx->OMGetRenderTargets(1,&s.rtv,&s.dsv); g_ctx->RSGetViewports(&s.vpN,s.vp);
         g_ctx->VSGetShader(&s.vs,nullptr,nullptr); g_ctx->PSGetShader(&s.ps,nullptr,nullptr); g_ctx->IAGetInputLayout(&s.il);
-        g_ctx->IAGetPrimitiveTopology(&s.topo); g_ctx->PSGetShaderResources(0,1,&s.srv); g_ctx->PSGetSamplers(0,1,&s.smp); g_ctx->PSGetConstantBuffers(0,1,&s.cb); }
+        g_ctx->IAGetPrimitiveTopology(&s.topo); g_ctx->PSGetShaderResources(0,1,&s.srv); g_ctx->PSGetSamplers(0,1,&s.smp); g_ctx->PSGetConstantBuffers(0,1,&s.cb);
+        g_ctx->OMGetBlendState(&s.bl,s.bf,&s.mask);
+        g_ctx->OMGetDepthStencilState(&s.dss,&s.sref);
+        g_ctx->RSGetState(&s.rs);
+        g_ctx->RSGetScissorRects(&s.scN,s.sc); }
     void restore(SB& s){ g_ctx->OMSetRenderTargets(1,&s.rtv,s.dsv); if(s.vpN)g_ctx->RSSetViewports(s.vpN,s.vp);
         g_ctx->VSSetShader(s.vs,nullptr,0); g_ctx->PSSetShader(s.ps,nullptr,0); g_ctx->IASetInputLayout(s.il);
         g_ctx->IASetPrimitiveTopology(s.topo); g_ctx->PSSetShaderResources(0,1,&s.srv); g_ctx->PSSetSamplers(0,1,&s.smp); g_ctx->PSSetConstantBuffers(0,1,&s.cb);
+        g_ctx->OMSetBlendState(s.bl,s.bf,s.mask);
+        g_ctx->OMSetDepthStencilState(s.dss,s.sref);
+        g_ctx->RSSetState(s.rs);
+        if(s.scN)g_ctx->RSSetScissorRects(s.scN,s.sc);
         if(s.rtv)s.rtv->Release(); if(s.dsv)s.dsv->Release(); if(s.vs)s.vs->Release(); if(s.ps)s.ps->Release();
-        if(s.il)s.il->Release(); if(s.srv)s.srv->Release(); if(s.smp)s.smp->Release(); if(s.cb)s.cb->Release(); }
+        if(s.il)s.il->Release(); if(s.srv)s.srv->Release(); if(s.smp)s.smp->Release(); if(s.cb)s.cb->Release();
+        if(s.bl)s.bl->Release(); if(s.dss)s.dss->Release(); if(s.rs)s.rs->Release(); }
 }
 
 void sharpen(IDXGISwapChain* sc){
@@ -163,6 +199,11 @@ void sharpen(IDXGISwapChain* sc){
     g_ctx->PSSetSamplers(0,1,&g_smp); g_ctx->PSSetConstantBuffers(0,1,&g_cb);
     g_ctx->PSSetShaderResources(0,1,&g_tmp_srv);
     D3D11_VIEWPORT vp{}; vp.Width=(float)g_w; vp.Height=(float)g_h; vp.MaxDepth=1.f; g_ctx->RSSetViewports(1,&vp);
+    // Force opaque write, no depth, no scissor -- never inherit the game's.
+    const FLOAT bf[4]={0,0,0,0};
+    g_ctx->OMSetBlendState(g_blend,bf,0xffffffff);
+    g_ctx->OMSetDepthStencilState(g_dss,0);
+    g_ctx->RSSetState(g_rs);
     g_ctx->OMSetRenderTargets(1,&rtv,nullptr);
     g_ctx->Draw(3,0);
     ID3D11ShaderResourceView* nul=nullptr; g_ctx->PSSetShaderResources(0,1,&nul);
@@ -171,6 +212,8 @@ void sharpen(IDXGISwapChain* sc){
 }
 void on_resize(){ if(g_tmp_srv){g_tmp_srv->Release();g_tmp_srv=nullptr;} if(g_tmp){g_tmp->Release();g_tmp=nullptr;} }
 void shutdown(){ on_resize();
+    if(g_rs)g_rs->Release(); if(g_dss)g_dss->Release(); if(g_blend)g_blend->Release();
+    g_rs=nullptr; g_dss=nullptr; g_blend=nullptr;
     if(g_cb)g_cb->Release(); if(g_smp)g_smp->Release(); if(g_ps)g_ps->Release(); if(g_vs)g_vs->Release();
     if(g_ctx)g_ctx->Release(); if(g_dev)g_dev->Release(); g_ready=false; }
 

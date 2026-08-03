@@ -41,5 +41,10 @@ FSRINJ_DX12_PACE_FRACTION = 0.5 ; 0.1 - 0.9, where between real frames to land
 FSRINJ_DX12_IMGUI = 1           ; 0 forces the legacy hand-drawn menu
 
 [dx11]
+# The DX11 sharpener and frame generation both default to OFF (they are enabled
+# from the menu). Set these to 1 to have them ON at startup instead -- useful
+# for testing without opening the menu.
+FSRINJ_DX11_SHARPEN = 0
+FSRINJ_DX11_FRAMEGEN = 0
 FSRINJ_DX11_PACING = 1          ; generated-frame pacing on the DX11 path
 FSRINJ_DX11_MENU_IN_GEN = 1     ; draw the menu into generated frames (no flicker)
